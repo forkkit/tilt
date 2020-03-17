@@ -6,13 +6,16 @@ import (
 	"github.com/windmilleng/tilt/internal/container"
 	"github.com/windmilleng/tilt/internal/dockercompose"
 	"github.com/windmilleng/tilt/pkg/model"
+	"github.com/windmilleng/tilt/pkg/model/logstore"
 )
+
+const LogLineCount = 50
 
 const TiltfileResourceName = "(Tiltfile)"
 
 type ResourceInfoView interface {
 	resourceInfoView()
-	RuntimeLog() model.Log
+	RuntimeSpanID() logstore.SpanID
 	Status() string
 }
 
@@ -20,25 +23,25 @@ type DCResourceInfo struct {
 	ConfigPaths     []string
 	ContainerStatus dockercompose.Status
 	ContainerID     container.ID
-	Log             model.Log
+	SpanID          logstore.SpanID
 	StartTime       time.Time
 }
 
-func NewDCResourceInfo(configPaths []string, status dockercompose.Status, cID container.ID, log model.Log, startTime time.Time) DCResourceInfo {
+func NewDCResourceInfo(configPaths []string, status dockercompose.Status, cID container.ID, spanID logstore.SpanID, startTime time.Time) DCResourceInfo {
 	return DCResourceInfo{
 		ConfigPaths:     configPaths,
 		ContainerStatus: status,
 		ContainerID:     cID,
-		Log:             log,
+		SpanID:          spanID,
 		StartTime:       startTime,
 	}
 }
 
 var _ ResourceInfoView = DCResourceInfo{}
 
-func (DCResourceInfo) resourceInfoView()            {}
-func (dcInfo DCResourceInfo) RuntimeLog() model.Log { return dcInfo.Log }
-func (dcInfo DCResourceInfo) Status() string        { return string(dcInfo.ContainerStatus) }
+func (DCResourceInfo) resourceInfoView()                     {}
+func (dcInfo DCResourceInfo) RuntimeSpanID() logstore.SpanID { return dcInfo.SpanID }
+func (dcInfo DCResourceInfo) Status() string                 { return string(dcInfo.ContainerStatus) }
 
 type K8sResourceInfo struct {
 	PodName            string
@@ -46,14 +49,14 @@ type K8sResourceInfo struct {
 	PodUpdateStartTime time.Time
 	PodStatus          string
 	PodRestarts        int
-	PodLog             model.Log
+	SpanID             logstore.SpanID
 }
 
 var _ ResourceInfoView = K8sResourceInfo{}
 
-func (K8sResourceInfo) resourceInfoView()             {}
-func (k8sInfo K8sResourceInfo) RuntimeLog() model.Log { return k8sInfo.PodLog }
-func (k8sInfo K8sResourceInfo) Status() string        { return k8sInfo.PodStatus }
+func (K8sResourceInfo) resourceInfoView()                      {}
+func (k8sInfo K8sResourceInfo) RuntimeSpanID() logstore.SpanID { return k8sInfo.SpanID }
+func (k8sInfo K8sResourceInfo) Status() string                 { return k8sInfo.PodStatus }
 
 type YAMLResourceInfo struct {
 	K8sResources []string
@@ -61,20 +64,25 @@ type YAMLResourceInfo struct {
 
 var _ ResourceInfoView = YAMLResourceInfo{}
 
-func (YAMLResourceInfo) resourceInfoView()              {}
-func (yamlInfo YAMLResourceInfo) RuntimeLog() model.Log { return model.NewLog("") }
-func (yamlInfo YAMLResourceInfo) Status() string        { return "" }
+func (YAMLResourceInfo) resourceInfoView()                       {}
+func (yamlInfo YAMLResourceInfo) RuntimeSpanID() logstore.SpanID { return "unknown" }
+func (yamlInfo YAMLResourceInfo) Status() string                 { return "" }
 
 type LocalResourceInfo struct {
+	status model.RuntimeStatus
+	pid    int
+	spanID model.LogSpanID
+}
+
+func NewLocalResourceInfo(status model.RuntimeStatus, pid int, spanID model.LogSpanID) LocalResourceInfo {
+	return LocalResourceInfo{status: status, pid: pid, spanID: spanID}
 }
 
 var _ ResourceInfoView = LocalResourceInfo{}
 
-var LocalResourceStatusPlaceholder = "local-resource-ok"
-
-func (LocalResourceInfo) resourceInfoView()     {}
-func (LocalResourceInfo) RuntimeLog() model.Log { return model.Log{} }                    // no runtime log, only build log
-func (LocalResourceInfo) Status() string        { return LocalResourceStatusPlaceholder } // no status independent of build status
+func (lri LocalResourceInfo) resourceInfoView()              {}
+func (lri LocalResourceInfo) RuntimeSpanID() logstore.SpanID { return lri.spanID }
+func (lri LocalResourceInfo) Status() string                 { return string(lri.status) }
 
 type Resource struct {
 	Name               model.ManifestName
@@ -153,10 +161,6 @@ func (r Resource) DefaultCollapse() bool {
 		autoExpand = k8sInfo.PodRestarts > 0 || k8sInfo.PodStatus == "CrashLoopBackOff" || k8sInfo.PodStatus == "Error"
 	}
 
-	if r.IsYAML() {
-		autoExpand = true
-	}
-
 	if r.IsDC() && r.DockerComposeTarget().Status() == string(dockercompose.StatusCrash) {
 		autoExpand = true
 	}
@@ -164,7 +168,7 @@ func (r Resource) DefaultCollapse() bool {
 	autoExpand = autoExpand ||
 		r.LastBuild().Error != nil ||
 		!r.CrashLog.Empty() ||
-		len(r.LastBuild().Warnings) > 0 ||
+		r.LastBuild().WarningCount > 0 ||
 		r.LastBuild().Reason.Has(model.BuildReasonFlagCrash) ||
 		r.CurrentBuild.Reason.Has(model.BuildReasonFlagCrash) ||
 		r.PendingBuildReason.Has(model.BuildReasonFlagCrash)
@@ -183,11 +187,10 @@ func (r Resource) IsCollapsed(rv ResourceViewState) bool {
 // Client should always hold this as a value struct, and copy it
 // whenever they need to mutate something.
 type View struct {
-	Log           model.Log
-	Resources     []Resource
-	IsProfiling   bool
-	LogTimestamps bool
-	FatalError    error
+	LogReader   logstore.Reader
+	Resources   []Resource
+	IsProfiling bool
+	FatalError  error
 }
 
 func (v View) TiltfileErrorMessage() string {
@@ -213,14 +216,14 @@ func (v View) Resource(n model.ManifestName) (Resource, bool) {
 }
 
 type ViewState struct {
-	ShowNarration         bool
-	NarrationMessage      string
-	Resources             []ResourceViewState
-	ProcessedLogByteCount int
-	AlertMessage          string
-	TabState              TabState
-	SelectedIndex         int
-	TiltLogState          TiltLogState
+	ShowNarration    bool
+	NarrationMessage string
+	Resources        []ResourceViewState
+	ProcessedLogs    logstore.Checkpoint
+	AlertMessage     string
+	TabState         TabState
+	SelectedIndex    int
+	TiltLogState     TiltLogState
 }
 
 type TabState int
@@ -228,7 +231,7 @@ type TabState int
 const (
 	TabAllLog TabState = iota
 	TabBuildLog
-	TabPodLog
+	TabRuntimeLog
 )
 
 type CollapseState int

@@ -9,14 +9,25 @@ import (
 	"strconv"
 	"time"
 
+	wmanalytics "github.com/windmilleng/wmclient/pkg/analytics"
 	"go.starlark.net/resolve"
 	"go.starlark.net/starlark"
+
+	"github.com/windmilleng/tilt/internal/tiltfile/updatesettings"
 
 	"github.com/windmilleng/tilt/internal/analytics"
 	"github.com/windmilleng/tilt/internal/dockercompose"
 	"github.com/windmilleng/tilt/internal/feature"
 	"github.com/windmilleng/tilt/internal/k8s"
 	"github.com/windmilleng/tilt/internal/ospath"
+	"github.com/windmilleng/tilt/internal/sliceutils"
+	tiltfileanalytics "github.com/windmilleng/tilt/internal/tiltfile/analytics"
+	"github.com/windmilleng/tilt/internal/tiltfile/dockerprune"
+	"github.com/windmilleng/tilt/internal/tiltfile/io"
+	"github.com/windmilleng/tilt/internal/tiltfile/k8scontext"
+	"github.com/windmilleng/tilt/internal/tiltfile/telemetry"
+	"github.com/windmilleng/tilt/internal/tiltfile/value"
+	"github.com/windmilleng/tilt/internal/tiltfile/version"
 	"github.com/windmilleng/tilt/pkg/model"
 )
 
@@ -27,17 +38,22 @@ func init() {
 	resolve.AllowLambda = true
 	resolve.AllowNestedDef = true
 	resolve.AllowGlobalReassign = true
+	resolve.AllowRecursion = true
 }
 
 type TiltfileLoadResult struct {
-	Manifests          []model.Manifest
-	ConfigFiles        []string
-	Warnings           []string
-	TiltIgnoreContents string
-	FeatureFlags       map[string]bool
-	TeamName           string
-	Secrets            model.SecretSet
-	Error              error
+	Manifests           []model.Manifest
+	ConfigFiles         []string
+	TiltIgnoreContents  string
+	FeatureFlags        map[string]bool
+	TeamName            string
+	TelemetrySettings   model.TelemetrySettings
+	Secrets             model.SecretSet
+	Error               error
+	DockerPruneSettings model.DockerPruneSettings
+	AnalyticsOpt        wmanalytics.Opt
+	VersionSettings     model.VersionSettings
+	UpdateSettings      model.UpdateSettings
 }
 
 func (r TiltfileLoadResult) Orchestrator() model.Orchestrator {
@@ -58,11 +74,12 @@ type TiltfileLoader interface {
 	// We want to be very careful not to treat non-zero exit codes like an error.
 	// Because even if the Tiltfile has errors, we might need to watch files
 	// or return partial results (like enabled features).
-	Load(ctx context.Context, filename string, matching map[string]bool) TiltfileLoadResult
+	Load(ctx context.Context, filename string, userConfigState model.UserConfigState) TiltfileLoadResult
 }
 
 type FakeTiltfileLoader struct {
-	Result TiltfileLoadResult
+	Result          TiltfileLoadResult
+	userConfigState model.UserConfigState
 }
 
 var _ TiltfileLoader = &FakeTiltfileLoader{}
@@ -71,46 +88,50 @@ func NewFakeTiltfileLoader() *FakeTiltfileLoader {
 	return &FakeTiltfileLoader{}
 }
 
-func (tfl *FakeTiltfileLoader) Load(ctx context.Context, filename string, matching map[string]bool) TiltfileLoadResult {
+func (tfl *FakeTiltfileLoader) Load(ctx context.Context, filename string, userConfigState model.UserConfigState) TiltfileLoadResult {
+	tfl.userConfigState = userConfigState
 	return tfl.Result
+}
+
+// the UserConfigState that was passed to the last invocation of Load
+func (tfl *FakeTiltfileLoader) PassedUserConfigState() model.UserConfigState {
+	return tfl.userConfigState
 }
 
 func ProvideTiltfileLoader(
 	analytics *analytics.TiltAnalytics,
 	kCli k8s.Client,
+	k8sContextExt k8scontext.Extension,
 	dcCli dockercompose.DockerComposeClient,
-	kubeContext k8s.KubeContext,
-	kubeEnv k8s.Env,
-	fDefaults feature.Defaults) TiltfileLoader {
+	webHost model.WebHost,
+	fDefaults feature.Defaults,
+	env k8s.Env) TiltfileLoader {
 	return tiltfileLoader{
-		analytics:   analytics,
-		kCli:        kCli,
-		dcCli:       dcCli,
-		kubeContext: kubeContext,
-		kubeEnv:     kubeEnv,
-		fDefaults:   fDefaults,
+		analytics:     analytics,
+		kCli:          kCli,
+		k8sContextExt: k8sContextExt,
+		dcCli:         dcCli,
+		webHost:       webHost,
+		fDefaults:     fDefaults,
+		env:           env,
 	}
 }
 
 type tiltfileLoader struct {
-	analytics   *analytics.TiltAnalytics
-	kCli        k8s.Client
-	dcCli       dockercompose.DockerComposeClient
-	kubeContext k8s.KubeContext
-	kubeEnv     k8s.Env
-	fDefaults   feature.Defaults
+	analytics *analytics.TiltAnalytics
+	kCli      k8s.Client
+	dcCli     dockercompose.DockerComposeClient
+	webHost   model.WebHost
+
+	k8sContextExt k8scontext.Extension
+	fDefaults     feature.Defaults
+	env           k8s.Env
 }
 
 var _ TiltfileLoader = &tiltfileLoader{}
 
-func printWarnings(s *tiltfileState) {
-	for _, w := range s.warnings {
-		s.logger.Infof("WARNING: %s\n", w)
-	}
-}
-
 // Load loads the Tiltfile in `filename`
-func (tfl tiltfileLoader) Load(ctx context.Context, filename string, matching map[string]bool) TiltfileLoadResult {
+func (tfl tiltfileLoader) Load(ctx context.Context, filename string, userConfigState model.UserConfigState) TiltfileLoadResult {
 	start := time.Now()
 	absFilename, err := ospath.RealAbs(filename)
 	if err != nil {
@@ -142,21 +163,39 @@ func (tfl tiltfileLoader) Load(ctx context.Context, filename string, matching ma
 
 	tlr.TiltIgnoreContents = string(tiltIgnoreContents)
 
-	privateRegistry := tfl.kCli.PrivateRegistry(ctx)
-	s := newTiltfileState(ctx, tfl.dcCli, tfl.kubeContext, tfl.kubeEnv, privateRegistry, feature.FromDefaults(tfl.fDefaults))
+	localRegistry := tfl.kCli.LocalRegistry(ctx)
 
-	manifests, err := s.loadManifests(absFilename, matching)
+	s := newTiltfileState(ctx, tfl.dcCli, tfl.webHost, tfl.k8sContextExt, localRegistry, feature.FromDefaults(tfl.fDefaults))
+
+	manifests, result, err := s.loadManifests(absFilename, userConfigState)
+
+	ioState, _ := io.GetState(result)
+	tlr.ConfigFiles = sliceutils.AppendWithoutDupes(ioState.Files, s.postExecReadFiles...)
+
+	dps, _ := dockerprune.GetState(result)
+	tlr.DockerPruneSettings = dps
+
+	aSettings, _ := tiltfileanalytics.GetState(result)
+	tlr.AnalyticsOpt = aSettings.Opt
+
 	tlr.Secrets = s.extractSecrets()
-	tlr.ConfigFiles = s.configFiles
-	tlr.Warnings = s.warnings
 	tlr.FeatureFlags = s.features.ToEnabled()
 	tlr.Error = err
 	tlr.Manifests = manifests
 	tlr.TeamName = s.teamName
 
-	printWarnings(s)
-	s.logger.Infof("Successfully loaded Tiltfile")
-	tfl.reportTiltfileLoaded(s.builtinCallCounts, s.builtinArgCounts, time.Since(start))
+	vs, _ := version.GetState(result)
+	tlr.VersionSettings = vs
+
+	telemetrySettings, _ := telemetry.GetState(result)
+	tlr.TelemetrySettings = telemetrySettings
+
+	us, _ := updatesettings.GetState(result)
+	tlr.UpdateSettings = us
+
+	duration := time.Since(start)
+	s.logger.Infof("Successfully loaded Tiltfile (%s)", duration)
+	tfl.reportTiltfileLoaded(s.builtinCallCounts, s.builtinArgCounts, duration)
 
 	return tlr
 }
@@ -166,53 +205,18 @@ func tiltIgnorePath(tiltfilePath string) string {
 	return filepath.Join(filepath.Dir(tiltfilePath), TiltIgnoreFileName)
 }
 
-func skylarkStringDictToGoMap(d *starlark.Dict) (map[string]string, error) {
-	r := map[string]string{}
-
-	for _, tuple := range d.Items() {
-		kV, ok := AsString(tuple[0])
-		if !ok {
-			return nil, fmt.Errorf("key is not a string: %T (%v)", tuple[0], tuple[0])
-		}
-
-		k := string(kV)
-
-		vV, ok := AsString(tuple[1])
-		if !ok {
-			return nil, fmt.Errorf("value is not a string: %T (%v)", tuple[1], tuple[1])
-		}
-
-		v := string(vV)
-
-		r[k] = v
-	}
-
-	return r, nil
-}
-
-// If `v` is a `starlark.Sequence`, return a slice of its elements
-// Otherwise, return it as a single-element slice
-// For functions that take `Union[List[T], T]`
 func starlarkValueOrSequenceToSlice(v starlark.Value) []starlark.Value {
-	if seq, ok := v.(starlark.Sequence); ok {
-		var ret []starlark.Value
-		it := seq.Iterate()
-		defer it.Done()
-		var i starlark.Value
-		for it.Next(&i) {
-			ret = append(ret, i)
-		}
-		return ret
-	} else if v == nil || v == starlark.None {
-		return nil
-	} else {
-		return []starlark.Value{v}
-	}
+	return value.ValueOrSequenceToSlice(v)
 }
 
 func (tfl *tiltfileLoader) reportTiltfileLoaded(callCounts map[string]int,
 	argCounts map[string]map[string]int, loadDur time.Duration) {
 	tags := make(map[string]string)
+
+	// env should really be a global tag, but there's a circular dependency
+	// between the global tags and env initialization, so we add it manually.
+	tags["env"] = string(tfl.env)
+
 	for builtinName, count := range callCounts {
 		tags[fmt.Sprintf("tiltfile.invoked.%s", builtinName)] = strconv.Itoa(count)
 	}

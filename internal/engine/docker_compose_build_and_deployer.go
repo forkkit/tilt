@@ -11,6 +11,7 @@ import (
 	"github.com/windmilleng/tilt/internal/container"
 	"github.com/windmilleng/tilt/internal/docker"
 	"github.com/windmilleng/tilt/internal/dockercompose"
+	"github.com/windmilleng/tilt/internal/engine/buildcontrol"
 	"github.com/windmilleng/tilt/internal/store"
 	"github.com/windmilleng/tilt/pkg/logger"
 	"github.com/windmilleng/tilt/pkg/model"
@@ -57,7 +58,7 @@ func (bd *DockerComposeBuildAndDeployer) extract(specs []model.TargetSpec) ([]mo
 func (bd *DockerComposeBuildAndDeployer) BuildAndDeploy(ctx context.Context, st store.RStore, specs []model.TargetSpec, currentState store.BuildStateSet) (store.BuildResultSet, error) {
 	iTargets, dcTargets := bd.extract(specs)
 	if len(dcTargets) != 1 {
-		return store.BuildResultSet{}, SilentRedirectToNextBuilderf(
+		return store.BuildResultSet{}, buildcontrol.SilentRedirectToNextBuilderf(
 			"DockerComposeBuildAndDeployer requires exactly one dcTarget (got %d)", len(dcTargets))
 	}
 	dcTarget := dcTargets[0]
@@ -66,7 +67,7 @@ func (bd *DockerComposeBuildAndDeployer) BuildAndDeploy(ctx context.Context, st 
 	span.SetTag("target", dcTargets[0].Name)
 	defer span.Finish()
 
-	q, err := NewImageTargetQueue(ctx, iTargets, currentState, bd.icb.ib.ImageExists)
+	q, err := buildcontrol.NewImageTargetQueue(ctx, iTargets, currentState, bd.icb.ib.ImageExists)
 	if err != nil {
 		return store.BuildResultSet{}, err
 	}
@@ -81,30 +82,30 @@ func (bd *DockerComposeBuildAndDeployer) BuildAndDeploy(ctx context.Context, st 
 	err = q.RunBuilds(func(target model.TargetSpec, state store.BuildState, depResults []store.BuildResult) (store.BuildResult, error) {
 		iTarget, ok := target.(model.ImageTarget)
 		if !ok {
-			return store.BuildResult{}, fmt.Errorf("Not an image target: %T", target)
+			return nil, fmt.Errorf("Not an image target: %T", target)
 		}
 
 		iTarget, err := injectImageDependencies(iTarget, iTargetMap, depResults)
 		if err != nil {
-			return store.BuildResult{}, err
+			return nil, err
 		}
 
-		expectedRef := iTarget.ConfigurationRef
+		expectedRef := iTarget.Refs.ConfigurationRef
 
 		// NOTE(maia): we assume that this func takes one DC target and up to one image target
 		// corresponding to that service. If this func ever supports specs for more than one
 		// service at once, we'll have to match up image build results to DC target by ref.
-		ref, err := bd.icb.Build(ctx, iTarget, currentState[iTarget.ID()], ps)
+		refs, err := bd.icb.Build(ctx, iTarget, currentState[iTarget.ID()], ps)
 		if err != nil {
-			return store.BuildResult{}, err
+			return nil, err
 		}
 
-		ref, err = bd.tagWithExpected(ctx, ref, expectedRef)
+		ref, err := bd.tagWithExpected(ctx, refs.LocalRef, expectedRef)
 		if err != nil {
-			return store.BuildResult{}, err
+			return nil, err
 		}
 
-		return store.NewImageBuildResult(iTarget.ID(), ref), nil
+		return store.NewImageBuildResultSingleRef(iTarget.ID(), ref), nil
 	})
 
 	if err != nil {
@@ -125,11 +126,14 @@ func (bd *DockerComposeBuildAndDeployer) BuildAndDeploy(ctx context.Context, st 
 		return store.BuildResultSet{}, err
 	}
 
-	results := q.results
+	results := q.Results()
 	results[dcTarget.ID()] = store.NewDockerComposeDeployResult(dcTarget.ID(), cid)
 	return results, nil
 }
 
+// tagWithExpected tags the given ref as whatever Docker Compose expects, i.e. as
+// the `image` value given in docker-compose.yaml. (If DC yaml specifies an image
+// with a tag, use that name + tag; otherwise, tag as latest.)
 func (bd *DockerComposeBuildAndDeployer) tagWithExpected(ctx context.Context, ref reference.NamedTagged,
 	expected container.RefSelector) (reference.NamedTagged, error) {
 	var tagAs reference.NamedTagged

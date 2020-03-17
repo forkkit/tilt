@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/windmilleng/tilt/internal/output"
 	"github.com/windmilleng/tilt/pkg/logger"
 
 	"github.com/gdamore/tcell"
@@ -29,13 +30,12 @@ const DefaultRefreshInterval = 100 * time.Millisecond
 // (we don't currently worry about trying to know how big a page is, and instead just support pgup/dn as "faster arrows"
 const pgUpDownCount = 20
 
+type HudEnabled bool
+
 type HeadsUpDisplay interface {
 	store.Subscriber
 
 	Run(ctx context.Context, dispatch func(action store.Action), refreshRate time.Duration) error
-	Update(v view.View, vs view.ViewState) error
-	Close()
-	SetNarrationMessage(ctx context.Context, msg string) error
 }
 
 type Hud struct {
@@ -51,6 +51,13 @@ type Hud struct {
 
 var _ HeadsUpDisplay = (*Hud)(nil)
 
+func ProvideHud(hudEnabled HudEnabled, renderer *Renderer, webURL model.WebURL, analytics *analytics.TiltAnalytics, printer *IncrementalPrinter) (HeadsUpDisplay, error) {
+	if !hudEnabled {
+		return NewDisabledHud(printer), nil
+	}
+	return NewDefaultHeadsUpDisplay(renderer, webURL, analytics)
+}
+
 func NewDefaultHeadsUpDisplay(renderer *Renderer, webURL model.WebURL, analytics *analytics.TiltAnalytics) (HeadsUpDisplay, error) {
 	return &Hud{
 		r:      renderer,
@@ -59,16 +66,22 @@ func NewDefaultHeadsUpDisplay(renderer *Renderer, webURL model.WebURL, analytics
 	}, nil
 }
 
-func (h *Hud) SetNarrationMessage(ctx context.Context, msg string) error {
+func (h *Hud) SetNarrationMessage(ctx context.Context, msg string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	currentViewState := h.currentViewState
 	currentViewState.ShowNarration = true
 	currentViewState.NarrationMessage = msg
-	return h.setViewState(ctx, currentViewState)
+	h.setViewState(ctx, currentViewState)
 }
 
 func (h *Hud) Run(ctx context.Context, dispatch func(action store.Action), refreshRate time.Duration) error {
+	// Redirect stdout and stderr into our logger
+	err := output.CaptureAllOutput(logger.Get(ctx).Writer(logger.InfoLvl))
+	if err != nil {
+		logger.Get(ctx).Infof("Error capturing stdout and stderr: %v", err)
+	}
+
 	h.mu.Lock()
 	h.isRunning = true
 	h.mu.Unlock()
@@ -80,6 +93,7 @@ func (h *Hud) Run(ctx context.Context, dispatch func(action store.Action), refre
 	}()
 
 	screenEvents, err := h.r.SetUp()
+
 	if err != nil {
 		return errors.Wrap(err, "setting up screen")
 	}
@@ -97,19 +111,15 @@ func (h *Hud) Run(ctx context.Context, dispatch func(action store.Action), refre
 			err := ctx.Err()
 			if err != context.Canceled {
 				return err
-			} else {
-				return nil
 			}
+			return nil
 		case e := <-screenEvents:
 			done := h.handleScreenEvent(ctx, dispatch, e)
 			if done {
 				return nil
 			}
 		case <-ticker.C:
-			err := h.Refresh(ctx)
-			if err != nil {
-				return err
-			}
+			h.Refresh(ctx)
 		}
 	}
 }
@@ -183,7 +193,7 @@ func (h *Hud) handleScreenEvent(ctx context.Context, dispatch func(action store.
 				h.currentViewState.TabState = view.TabBuildLog
 			case r == '3':
 				h.recordInteraction("tab_pod_log")
-				h.currentViewState.TabState = view.TabPodLog
+				h.currentViewState.TabState = view.TabRuntimeLog
 			}
 		case tcell.KeyUp:
 			h.activeScroller().Up()
@@ -212,7 +222,7 @@ func (h *Hud) handleScreenEvent(ctx context.Context, dispatch func(action store.
 			}
 			url := h.webURL
 			url.Path = fmt.Sprintf("/r/%s/", r.Name)
-			h.a.Incr("ui.interactions.open_log", map[string]string{"is_tiltfile": strconv.FormatBool(r.Name == view.TiltfileResourceName)})
+			h.a.Incr("ui.interactions.open_log", map[string]string{"is_tiltfile": strconv.FormatBool(r.Name == store.TiltfileManifestName)})
 			_ = browser.OpenURL(url.String())
 		case tcell.KeyRight:
 			i, _ := h.selectedResource()
@@ -238,8 +248,6 @@ func (h *Hud) handleScreenEvent(ctx context.Context, dispatch func(action store.
 			}
 		case tcell.KeyCtrlO:
 			go writeHeapProfile(ctx)
-		case tcell.KeyCtrlT:
-			dispatch(SetLogTimestampsAction{!h.currentView.LogTimestamps})
 		}
 
 	case *tcell.EventResize:
@@ -247,35 +255,29 @@ func (h *Hud) handleScreenEvent(ctx context.Context, dispatch func(action store.
 		// just marking this as where sigwinch gets handled
 	}
 
-	err := h.refresh(ctx)
-	if err != nil {
-		dispatch(NewExitAction(err))
-	}
-
+	h.refresh(ctx)
 	return false
 }
 
 func (h *Hud) OnChange(ctx context.Context, st store.RStore) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	toPrint := ""
+
 	state := st.RLockState()
-	view := store.StateToView(state)
+	view := store.StateToView(state, st.StateMutex())
+
+	// if the hud isn't running, make sure new logs are visible on stdout
+	if !h.isRunning {
+		toPrint = state.LogStore.ContinuingString(h.currentViewState.ProcessedLogs)
+	}
+	h.currentViewState.ProcessedLogs = state.LogStore.Checkpoint()
+
 	st.RUnlockState()
 
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	err := h.setView(ctx, view)
-	if err != nil {
-		st.Dispatch(NewExitAction(err))
-	}
-}
+	fmt.Print(toPrint)
 
-func (h *Hud) Refresh(ctx context.Context) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.refresh(ctx)
-}
-
-// Must hold the lock
-func (h *Hud) setView(ctx context.Context, view view.View) error {
 	// if we're going from 1 resource (i.e., the Tiltfile) to more than 1, reset
 	// the resource selection, so that we're not scrolled to the bottom with the Tiltfile selected
 	if len(h.currentView.Resources) == 1 && len(view.Resources) > 1 {
@@ -283,26 +285,22 @@ func (h *Hud) setView(ctx context.Context, view view.View) error {
 	}
 	h.currentView = view
 	h.refreshSelectedIndex()
+}
 
-	// if the hud isn't running, make sure new logs are visible on stdout
-	logLen := view.Log.Len()
-	if !h.isRunning && h.currentViewState.ProcessedLogByteCount < logLen {
-		fmt.Print(view.Log.String()[h.currentViewState.ProcessedLogByteCount:])
-	}
-
-	h.currentViewState.ProcessedLogByteCount = logLen
-
-	return h.refresh(ctx)
+func (h *Hud) Refresh(ctx context.Context) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.refresh(ctx)
 }
 
 // Must hold the lock
-func (h *Hud) setViewState(ctx context.Context, currentViewState view.ViewState) error {
+func (h *Hud) setViewState(ctx context.Context, currentViewState view.ViewState) {
 	h.currentViewState = currentViewState
-	return h.refresh(ctx)
+	h.refresh(ctx)
 }
 
 // Must hold the lock
-func (h *Hud) refresh(ctx context.Context) error {
+func (h *Hud) refresh(ctx context.Context) {
 	// TODO: We don't handle the order of resources changing
 	for len(h.currentViewState.Resources) < len(h.currentView.Resources) {
 		h.currentViewState.Resources = append(h.currentViewState.Resources, view.ResourceViewState{})
@@ -311,16 +309,11 @@ func (h *Hud) refresh(ctx context.Context) error {
 	vs := h.currentViewState
 	vs.Resources = append(vs.Resources, h.currentViewState.Resources...)
 
-	return h.Update(h.currentView, h.currentViewState)
-}
-
-func (h *Hud) Update(v view.View, vs view.ViewState) error {
-	err := h.r.Render(v, vs)
-	return errors.Wrap(err, "error rendering hud")
+	h.r.Render(h.currentView, h.currentViewState)
 }
 
 func (h *Hud) resetResourceSelection() {
-	rty := h.r.rty
+	rty := h.r.RTY()
 	if rty == nil {
 		return
 	}
@@ -330,7 +323,7 @@ func (h *Hud) resetResourceSelection() {
 }
 
 func (h *Hud) refreshSelectedIndex() {
-	rty := h.r.rty
+	rty := h.r.RTY()
 	if rty == nil {
 		return
 	}

@@ -71,12 +71,17 @@
   padding-right: $spacing-unit / 2;
 }
 
-.Statusbar-statusMsgPanel-label {
+.LastEditStatus-label {
   text-transform: uppercase;
   font-size: $font-size-small;
   font-weight: bold;
   color: $color-gray-lightest;
   margin-right: $spacing-unit / 4;
+}
+.LastEditStatus-details {
+  @media (max-width: $tablet-width) {
+    display: none;
+  }
 }
 
 // Progress
@@ -124,9 +129,7 @@
   border: 2px solid $color-white;
   padding: $spacing-unit / 3;
   box-sizing: border-box;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  text-align: center;
   opacity: 0;
   pointer-events: none;
   transition: opacity $animation-timing ease;

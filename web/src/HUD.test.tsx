@@ -2,13 +2,18 @@ import React from "react"
 import ReactDOM from "react-dom"
 import { MemoryRouter } from "react-router"
 import HUD from "./HUD"
+import SocketBar from "./SocketBar"
 import { mount } from "enzyme"
 import {
   oneResourceView,
   twoResourceView,
   oneResourceNoAlerts,
-} from "./testdata.test"
+} from "./testdata"
 import { createMemoryHistory } from "history"
+import { SocketState } from "./types"
+import ReactModal from "react-modal"
+
+ReactModal.setAppElement(document.body)
 
 declare global {
   namespace NodeJS {
@@ -46,19 +51,27 @@ it("renders without crashing", () => {
   ReactDOM.unmountComponentAtNode(div)
 })
 
-it("renders loading screen", async () => {
+it("renders reconnecting bar", async () => {
   const root = mount(emptyHUD())
   const hud = root.find(HUD)
   expect(hud.text()).toEqual(expect.stringContaining("Loading"))
 
-  hud.setState({ Message: "Disconnected" })
-  expect(hud.text()).toEqual(expect.stringContaining("Disconnected"))
+  hud.setState({
+    view: oneResourceView(),
+    socketState: SocketState.Reconnecting,
+  })
+
+  let socketBar = root.find(SocketBar)
+  expect(socketBar).toHaveLength(1)
+  expect(socketBar.at(0).text()).toEqual(
+    expect.stringContaining("Reconnecting")
+  )
 })
 
 it("renders resource", async () => {
   const root = mount(emptyHUD())
   const hud = root.find(HUD)
-  hud.setState({ View: oneResourceView() })
+  hud.setState({ view: oneResourceView() })
   expect(root.find(".Statusbar")).toHaveLength(1)
   expect(root.find(".Sidebar")).toHaveLength(1)
 })
@@ -66,7 +79,7 @@ it("renders resource", async () => {
 it("opens sidebar on click", async () => {
   const root = mount(emptyHUD())
   const hud = root.find(HUD)
-  hud.setState({ View: oneResourceView() })
+  hud.setState({ view: oneResourceView() })
 
   let sidebar = root.find(".Sidebar")
   expect(sidebar).toHaveLength(1)
@@ -86,14 +99,24 @@ it("doesn't re-render the sidebar when the logs change", async () => {
   const hud = root.find(HUD)
 
   let resourceView = oneResourceView()
-  hud.setState({ View: resourceView })
+  hud.setState({ view: resourceView })
   let oldDOMNode = root.find(".Sidebar").getDOMNode()
-  let resource = resourceView.Resources[0]
-  if (!resource.K8sResourceInfo) throw new Error("missing k8s info")
-  resource.K8sResourceInfo.PodLog += "hello world\n"
-  hud.setState({ View: resourceView })
-  let newDOMNode = root.find(".Sidebar").getDOMNode()
 
+  function now() {
+    return new Date().toString()
+  }
+  resourceView.logList = {
+    spans: {
+      "": {},
+    },
+    segments: [
+      { text: "line1\n", time: now() },
+      { text: "line2\n", time: now() },
+    ],
+  }
+  hud.setState({ view: resourceView })
+
+  let newDOMNode = root.find(".Sidebar").getDOMNode()
   expect(oldDOMNode).toBe(newDOMNode)
 })
 
@@ -102,12 +125,12 @@ it("does re-render the sidebar when the resource list changes", async () => {
   const hud = root.find(HUD)
 
   let resourceView = oneResourceView()
-  hud.setState({ View: resourceView })
+  hud.setState({ view: resourceView })
   let sidebarLinks = root.find(".Sidebar-resources Link")
   expect(sidebarLinks).toHaveLength(2)
 
   let newResourceView = twoResourceView()
-  hud.setState({ View: newResourceView })
+  hud.setState({ view: newResourceView })
   sidebarLinks = root.find(".Sidebar-resources Link")
   expect(sidebarLinks).toHaveLength(3)
 })
@@ -117,9 +140,9 @@ it("renders tab nav", () => {
   const hud = root.find(HUD)
 
   let resourceView = oneResourceView()
-  hud.setState({ View: resourceView })
-  let tabNavLinks = root.find(".TabNav Link")
-  expect(tabNavLinks).toHaveLength(3)
+  hud.setState({ view: resourceView })
+  let tabNavLinks = root.find(".secondaryNav Link")
+  expect(tabNavLinks).toHaveLength(2)
 })
 
 it("renders number of errors in tabnav when no resource is selected", () => {
@@ -127,8 +150,8 @@ it("renders number of errors in tabnav when no resource is selected", () => {
   const hud = root.find(HUD)
 
   let resourceView = twoResourceView()
-  hud.setState({ View: resourceView })
-  let errorTab = root.find(".tabLink--errors")
+  hud.setState({ view: resourceView })
+  let errorTab = root.find(".secondaryNavLink--alerts")
   expect(errorTab.at(0).text()).toEqual("Alerts2")
 })
 
@@ -141,8 +164,8 @@ it("renders the number of errors a resource has in tabnav when a resource is sel
   const hud = root.find(HUD)
 
   let resourceView = twoResourceView()
-  hud.setState({ View: resourceView })
-  let errorTab = root.find(".tabLink--errors")
+  hud.setState({ view: resourceView })
+  let errorTab = root.find(".secondaryNavLink--alerts")
   expect(errorTab.at(0).text()).toEqual("Alerts1")
 })
 
@@ -151,11 +174,11 @@ it("renders two errors for a resource that has pod restarts and a build failure"
   const hud = root.find(HUD)
 
   let resourceView = oneResourceView()
-  let resource = resourceView.Resources[0]
-  if (!resource.K8sResourceInfo) throw new Error("missing k8s info")
-  resource.K8sResourceInfo.PodRestarts = 1
-  hud.setState({ View: resourceView })
-  let errorTab = root.find(".tabLink--errors")
+  let resource = resourceView.resources[0]
+  if (!resource.k8sResourceInfo) throw new Error("missing k8s info")
+  resource.k8sResourceInfo.podRestarts = 1
+  hud.setState({ view: resourceView })
+  let errorTab = root.find(".secondaryNavLink--alerts")
   expect(errorTab.at(0).text()).toEqual("Alerts2")
 })
 
@@ -164,12 +187,12 @@ it("renders two errors for a resource that has pod restarts, a build failure and
   const hud = root.find(HUD)
 
   let resourceView = oneResourceView()
-  let resource = resourceView.Resources[0]
-  if (!resource.K8sResourceInfo) throw new Error("missing k8s info")
-  resource.K8sResourceInfo.PodRestarts = 1
-  resourceView.Resources[0].RuntimeStatus = "CrashLoopBackOff"
-  hud.setState({ View: resourceView })
-  let errorTab = root.find(".tabLink--errors")
+  let resource = resourceView.resources[0]
+  if (!resource.k8sResourceInfo) throw new Error("missing k8s info")
+  resource.k8sResourceInfo.podRestarts = 1
+  resourceView.resources[0].runtimeStatus = "CrashLoopBackOff"
+  hud.setState({ view: resourceView })
+  let errorTab = root.find(".secondaryNavLink--alerts")
   expect(errorTab.at(0).text()).toEqual("Alerts2")
 })
 
@@ -177,72 +200,46 @@ it("renders no error count in tabnav if there are no errors", () => {
   const root = mount(emptyHUD())
   const hud = root.find(HUD)
 
-  hud.setState({ View: { Resources: [oneResourceNoAlerts()] } })
-  let errorTab = root.find(".tabLink--errors")
+  hud.setState({ view: { resources: [oneResourceNoAlerts()] } })
+  let errorTab = root.find(".secondaryNavLink--alerts")
   expect(errorTab.at(0).text()).toEqual("Alerts")
 })
 
 it("log page for nonexistent resource shows error", async () => {
   const root = mount(HUDAtPath("/r/nonexistentresource"))
   const hud = root.find(HUD)
-  hud.setState({ View: oneResourceView() })
+  hud.setState({ view: oneResourceView() })
 
-  let loadingScreen = root.find(".LoadingScreen")
+  let loadingScreen = root.find(".HeroScreen")
   expect(loadingScreen.at(0).text()).toEqual(
     "No resource found at /r/nonexistentresource"
-  )
-})
-
-it("preview page for nonexistent resource shows error", async () => {
-  const root = mount(HUDAtPath("/r/nonexistentresource/preview"))
-  const hud = root.find(HUD)
-  hud.setState({ View: oneResourceView() })
-
-  let loadingScreen = root.find(".LoadingScreen")
-  expect(loadingScreen.at(0).text()).toEqual(
-    "No resource found at /r/nonexistentresource/preview"
   )
 })
 
 it("alerts page for nonexistent resource shows error", async () => {
   const root = mount(HUDAtPath("/r/nonexistentresource/alerts"))
   const hud = root.find(HUD)
-  hud.setState({ View: oneResourceView() })
+  hud.setState({ view: oneResourceView() })
 
-  let loadingScreen = root.find(".LoadingScreen")
+  let loadingScreen = root.find(".HeroScreen")
   expect(loadingScreen.at(0).text()).toEqual(
     "No resource found at /r/nonexistentresource/alerts"
   )
-})
-
-it("preview pane for all resources", async () => {
-  const root = mount(HUDAtPath("/preview"))
-  const hud = root.find(HUD)
-  hud.setState({ View: twoResourceView() })
-
-  let previewScreens = root.find(".PreviewList")
-  expect(previewScreens).toHaveLength(1)
-  expect(previewScreens.at(0).text()).toEqual("snack")
-})
-
-it("preview pane for one resource", async () => {
-  const root = mount(HUDAtPath("/r/snack/preview"))
-  const hud = root.find(HUD)
-  hud.setState({ View: twoResourceView() })
-
-  let previewScreens = root.find(".PreviewPane")
-  expect(previewScreens).toHaveLength(1)
 })
 
 it("renders snapshot button if snapshots are enabled and this isn't a snapshot view", async () => {
   const root = mount(HUDAtPath("/"))
   const hud = root.find(HUD)
   let view = oneResourceView()
-  view.FeatureFlags = { snapshots: true }
-  hud.setState({ View: view })
+  view.featureFlags = { snapshots: true }
+  hud.setState({ view: view })
 
-  let snapshotSection = root.find(".TopBar-snapshotUrlWrap")
-  expect(snapshotSection.exists()).toBe(true)
+  let button = root.find("button.snapshotButton")
+  expect(button.exists()).toBe(true)
+
+  button.simulate("click")
+  root.update()
+  expect(hud.state().showSnapshotModal).toBe(true)
 })
 
 it("doesn't render snapshot button if snapshots are enabled and this is a snapshot view", async () => {
@@ -258,9 +255,88 @@ it("doesn't render snapshot button if snapshots are enabled and this is a snapsh
   const hud = root.find(HUD)
 
   let view = oneResourceView()
-  view.FeatureFlags = { snapshots: true }
-  hud.setState({ View: view })
+  view.featureFlags = { snapshots: true }
+  hud.setState({ view: view })
 
-  let snapshotSection = root.find(".TopBar-snapshotUrlWrap")
+  let snapshotSection = root.find(".TopBar-toolsButton")
   expect(snapshotSection.exists()).toBe(false)
+})
+
+it("loads logs incrementally", async () => {
+  const root = mount(emptyHUD())
+  const hud = root.find(HUD).instance() as HUD
+
+  let now = new Date().toString()
+  let resourceView = oneResourceView()
+  resourceView.logList = {
+    spans: {
+      "": {},
+    },
+    segments: [
+      { text: "line1\n", time: now },
+      { text: "line2\n", time: now },
+    ],
+    fromCheckpoint: 0,
+    toCheckpoint: 2,
+  }
+  hud.setAppState({ view: resourceView })
+
+  let resourceView2 = oneResourceView()
+  resourceView2.logList = {
+    spans: {
+      "": {},
+    },
+    segments: [
+      { text: "line3\n", time: now },
+      { text: "line4\n", time: now },
+    ],
+    fromCheckpoint: 2,
+    toCheckpoint: 4,
+  }
+  hud.setAppState({ view: resourceView2 })
+
+  root.update()
+  let snapshot = hud.snapshotFromState(hud.state)
+  expect(snapshot.view?.logList).toEqual({
+    spans: {
+      _: { manifestName: "" },
+    },
+    segments: [
+      { text: "line1\n", time: now, spanId: "_" },
+      { text: "line2\n", time: now, spanId: "_" },
+      { text: "line3\n", time: now, spanId: "_" },
+      { text: "line4\n", time: now, spanId: "_" },
+    ],
+  })
+})
+it("renders logs to snapshot", async () => {
+  const root = mount(emptyHUD())
+  const hud = root.find(HUD).instance() as HUD
+
+  let now = new Date().toString()
+  let resourceView = oneResourceView()
+  resourceView.logList = {
+    spans: {
+      "": {},
+    },
+    segments: [
+      { text: "line1\n", time: now, level: "WARN" },
+      { text: "line2\n", time: now, fields: { buildEvent: "1" } },
+    ],
+    fromCheckpoint: 0,
+    toCheckpoint: 2,
+  }
+  hud.setAppState({ view: resourceView })
+
+  root.update()
+  let snapshot = hud.snapshotFromState(hud.state)
+  expect(snapshot.view?.logList).toEqual({
+    spans: {
+      _: { manifestName: "" },
+    },
+    segments: [
+      { text: "line1\n", time: now, spanId: "_", level: "WARN" },
+      { text: "line2\n", time: now, spanId: "_", fields: { buildEvent: "1" } },
+    ],
+  })
 })

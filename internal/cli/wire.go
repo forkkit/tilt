@@ -10,19 +10,26 @@ import (
 	"github.com/google/wire"
 	"github.com/jonboulle/clockwork"
 	"github.com/windmilleng/wmclient/pkg/dirs"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"k8s.io/apimachinery/pkg/version"
 	"k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/windmilleng/tilt/internal/analytics"
 	"github.com/windmilleng/tilt/internal/build"
 	"github.com/windmilleng/tilt/internal/cloud"
+	"github.com/windmilleng/tilt/internal/cloud/cloudurl"
 	"github.com/windmilleng/tilt/internal/container"
-	"github.com/windmilleng/tilt/internal/demo"
 	"github.com/windmilleng/tilt/internal/docker"
 	"github.com/windmilleng/tilt/internal/dockercompose"
 	"github.com/windmilleng/tilt/internal/engine"
+	engineanalytics "github.com/windmilleng/tilt/internal/engine/analytics"
 	"github.com/windmilleng/tilt/internal/engine/configs"
+	"github.com/windmilleng/tilt/internal/engine/dockerprune"
+	"github.com/windmilleng/tilt/internal/engine/k8srollout"
 	"github.com/windmilleng/tilt/internal/engine/k8swatch"
+	"github.com/windmilleng/tilt/internal/engine/local"
+	"github.com/windmilleng/tilt/internal/engine/runtimelog"
+	"github.com/windmilleng/tilt/internal/engine/telemetry"
 	"github.com/windmilleng/tilt/internal/feature"
 	"github.com/windmilleng/tilt/internal/hud"
 	"github.com/windmilleng/tilt/internal/hud/server"
@@ -30,13 +37,12 @@ import (
 	"github.com/windmilleng/tilt/internal/store"
 	"github.com/windmilleng/tilt/internal/tiltfile"
 	"github.com/windmilleng/tilt/internal/token"
-	"github.com/windmilleng/tilt/pkg/assets"
+	"github.com/windmilleng/tilt/internal/tracer"
 	"github.com/windmilleng/tilt/pkg/model"
 )
 
 var K8sWireSet = wire.NewSet(
 	k8s.ProvideEnv,
-	k8s.DetectNodeIP,
 	k8s.ProvideClusterName,
 	k8s.ProvideKubeContext,
 	k8s.ProvideKubeConfig,
@@ -53,47 +59,49 @@ var K8sWireSet = wire.NewSet(
 
 var BaseWireSet = wire.NewSet(
 	K8sWireSet,
+	tiltfile.WireSet,
 	provideKubectlLogLevel,
 
 	docker.SwitchWireSet,
 
 	dockercompose.NewDockerComposeClient,
 
-	build.NewImageReaper,
-
-	tiltfile.ProvideTiltfileLoader,
-
 	clockwork.NewRealClock,
 	engine.DeployerWireSet,
-	engine.NewPodLogManager,
+	runtimelog.NewPodLogManager,
 	engine.NewPortForwardController,
 	engine.NewBuildController,
+	local.ProvideExecer,
+	local.NewController,
 	k8swatch.NewPodWatcher,
 	k8swatch.NewServiceWatcher,
 	k8swatch.NewEventWatchManager,
-	engine.NewImageController,
 	configs.NewConfigsController,
+	telemetry.NewController,
 	engine.NewDockerComposeEventWatcher,
-	engine.NewDockerComposeLogManager,
+	runtimelog.NewDockerComposeLogManager,
 	engine.NewProfilerManager,
 	engine.NewGithubClientFactory,
 	engine.NewTiltVersionChecker,
-	cloud.ProvideHttpClient,
-	cloud.NewUsernameManager,
+	cloud.WireSet,
+	cloudurl.ProvideAddress,
+	k8srollout.NewPodMonitor,
+	telemetry.NewStartTracker,
 
 	provideClock,
-	hud.NewRenderer,
-	hud.NewDefaultHeadsUpDisplay,
+	hud.WireSet,
 
 	provideLogActions,
 	store.NewStore,
-	wire.Bind(new(store.RStore), new(store.Store)),
+	wire.Bind(new(store.RStore), new(*store.Store)),
+
+	dockerprune.NewDockerPruner,
 
 	provideTiltInfo,
 	engine.ProvideSubscribers,
 	engine.NewUpper,
-	engine.NewTiltAnalyticsSubscriber,
-	engine.ProvideAnalyticsReporter,
+	engineanalytics.NewAnalyticsUpdater,
+	engineanalytics.ProvideAnalyticsReporter,
 	provideUpdateModeFlag,
 	engine.NewWatchManager,
 	engine.ProvideFsWatcherMaker,
@@ -103,43 +111,47 @@ var BaseWireSet = wire.NewSet(
 	provideWebMode,
 	provideWebURL,
 	provideWebPort,
-	provideWebDevPort,
+	provideWebHost,
 	provideNoBrowserFlag,
 	server.ProvideHeadsUpServer,
-	assets.ProvideAssetServer,
+	provideAssetServer,
 	server.ProvideHeadsUpServerController,
-	server.ProvideHttpClient,
+
+	tracer.NewSpanCollector,
+	wire.Bind(new(sdktrace.SpanProcessor), new(*tracer.SpanCollector)),
+	wire.Bind(new(tracer.SpanSource), new(*tracer.SpanCollector)),
 
 	dirs.UseWindmillDir,
 	token.GetOrCreateToken,
-	cloud.ProvideAddress,
 
-	provideThreads,
-	engine.NewKINDPusher,
+	wire.Struct(new(CmdUpDeps), "*"),
+	engine.NewKINDLoader,
 
 	wire.Value(feature.MainDefaults),
 )
 
-func wireDemo(ctx context.Context, branch demo.RepoBranch, analytics *analytics.TiltAnalytics) (demo.Script, error) {
-	wire.Build(BaseWireSet, demo.NewScript, build.ProvideClock)
-	return demo.Script{}, nil
+func wireTiltfileResult(ctx context.Context, analytics *analytics.TiltAnalytics) (cmdTiltfileResultDeps, error) {
+	wire.Build(BaseWireSet, newTiltfileResultDeps)
+	return cmdTiltfileResultDeps{}, nil
 }
 
-func wireThreads(ctx context.Context, analytics *analytics.TiltAnalytics) (Threads, error) {
+func wireDockerPrune(ctx context.Context, analytics *analytics.TiltAnalytics) (dpDeps, error) {
+	wire.Build(BaseWireSet, newDPDeps)
+	return dpDeps{}, nil
+}
+
+func wireCmdUp(ctx context.Context, hudEnabled hud.HudEnabled, analytics *analytics.TiltAnalytics, cmdUpTags engineanalytics.CmdUpTags) (CmdUpDeps, error) {
 	wire.Build(BaseWireSet, build.ProvideClock)
-	return Threads{}, nil
+	return CmdUpDeps{}, nil
 }
 
-type Threads struct {
-	hud          hud.HeadsUpDisplay
-	upper        engine.Upper
-	tiltBuild    model.TiltBuild
-	token        token.Token
-	cloudAddress cloud.Address
-}
-
-func provideThreads(h hud.HeadsUpDisplay, upper engine.Upper, b model.TiltBuild, token token.Token, cloudAddress cloud.Address) Threads {
-	return Threads{h, upper, b, token, cloudAddress}
+type CmdUpDeps struct {
+	Hud          hud.HeadsUpDisplay
+	Upper        engine.Upper
+	TiltBuild    model.TiltBuild
+	Token        token.Token
+	CloudAddress cloudurl.Address
+	Store        *store.Store
 }
 
 func wireKubeContext(ctx context.Context) (k8s.KubeContext, error) {

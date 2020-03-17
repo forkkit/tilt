@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/windmilleng/tilt/internal/container"
+	"github.com/windmilleng/tilt/internal/engine/buildcontrol"
 	"github.com/windmilleng/tilt/internal/k8s"
 
 	"github.com/windmilleng/tilt/internal/build"
@@ -34,9 +35,9 @@ var TestContainerInfo = store.ContainerInfo{
 }
 
 var TestBuildState = store.BuildState{
-	LastResult:        alreadyBuilt,
-	FilesChangedSet:   map[string]bool{"foo.py": true},
-	RunningContainers: []store.ContainerInfo{TestContainerInfo},
+	LastSuccessfulResult: alreadyBuilt,
+	FilesChangedSet:      map[string]bool{"foo.py": true},
+	RunningContainers:    []store.ContainerInfo{TestContainerInfo},
 }
 
 func TestBuildAndDeployBoilsSteps(t *testing.T) {
@@ -50,7 +51,7 @@ func TestBuildAndDeployBoilsSteps(t *testing.T) {
 		model.Run{Cmd: model.ToShellCmd("pip install"), Triggers: f.newPathSet("requirements.txt")},
 	}
 
-	err := f.lubad.buildAndDeploy(f.ctx, f.cu, model.ImageTarget{}, TestBuildState, []build.PathMapping{packageJson}, runs, false)
+	err := f.lubad.buildAndDeploy(f.ctx, f.ps, f.cu, model.ImageTarget{}, TestBuildState, []build.PathMapping{packageJson}, runs, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +83,7 @@ func TestUpdateInContainerArchivesFilesToCopyAndGetsFilesToRemove(t *testing.T) 
 		build.PathMapping{LocalPath: f.JoinPath("does-not-exist"), ContainerPath: "/src/does-not-exist"},
 	}
 
-	err := f.lubad.buildAndDeploy(f.ctx, f.cu, model.ImageTarget{}, TestBuildState, paths, nil, false)
+	err := f.lubad.buildAndDeploy(f.ctx, f.ps, f.cu, model.ImageTarget{}, TestBuildState, paths, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,9 +110,9 @@ func TestDontFallBackOnUserError(t *testing.T) {
 
 	f.cu.SetUpdateErr(build.RunStepFailure{ExitCode: 12345})
 
-	err := f.lubad.buildAndDeploy(f.ctx, f.cu, model.ImageTarget{}, TestBuildState, nil, nil, false)
+	err := f.lubad.buildAndDeploy(f.ctx, f.ps, f.cu, model.ImageTarget{}, TestBuildState, nil, nil, false)
 	if assert.NotNil(t, err) {
-		assert.IsType(t, DontFallBackError{}, err)
+		assert.IsType(t, buildcontrol.DontFallBackError{}, err)
 	}
 }
 
@@ -121,7 +122,7 @@ func TestUpdateContainerWithHotReload(t *testing.T) {
 
 	expectedHotReloads := []bool{true, true, false, true}
 	for _, hotReload := range expectedHotReloads {
-		err := f.lubad.buildAndDeploy(f.ctx, f.cu, model.ImageTarget{}, TestBuildState, nil, nil, hotReload)
+		err := f.lubad.buildAndDeploy(f.ctx, f.ps, f.cu, model.ImageTarget{}, TestBuildState, nil, nil, hotReload)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -154,9 +155,9 @@ func TestUpdateMultipleRunningContainers(t *testing.T) {
 
 	cInfos := []store.ContainerInfo{cInfo1, cInfo2}
 	state := store.BuildState{
-		LastResult:        alreadyBuilt,
-		FilesChangedSet:   map[string]bool{"foo.py": true},
-		RunningContainers: cInfos,
+		LastSuccessfulResult: alreadyBuilt,
+		FilesChangedSet:      map[string]bool{"foo.py": true},
+		RunningContainers:    cInfos,
 	}
 
 	paths := []build.PathMapping{
@@ -167,7 +168,7 @@ func TestUpdateMultipleRunningContainers(t *testing.T) {
 	cmd := model.ToShellCmd("./foo.sh bar")
 	runs := []model.Run{model.ToRun(cmd)}
 
-	err := f.lubad.buildAndDeploy(f.ctx, f.cu, model.ImageTarget{}, state, paths, runs, true)
+	err := f.lubad.buildAndDeploy(f.ctx, f.ps, f.cu, model.ImageTarget{}, state, paths, runs, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,13 +206,13 @@ func TestErrorStopsSubsequentContainerUpdates(t *testing.T) {
 
 	cInfos := []store.ContainerInfo{cInfo1, cInfo2}
 	state := store.BuildState{
-		LastResult:        alreadyBuilt,
-		FilesChangedSet:   map[string]bool{"foo.py": true},
-		RunningContainers: cInfos,
+		LastSuccessfulResult: alreadyBuilt,
+		FilesChangedSet:      map[string]bool{"foo.py": true},
+		RunningContainers:    cInfos,
 	}
 
 	f.cu.SetUpdateErr(fmt.Errorf("👀"))
-	err := f.lubad.buildAndDeploy(f.ctx, f.cu, model.ImageTarget{}, state, nil, nil, false)
+	err := f.lubad.buildAndDeploy(f.ctx, f.ps, f.cu, model.ImageTarget{}, state, nil, nil, false)
 	require.NotNil(t, err)
 	assert.Contains(t, "👀", err.Error())
 	require.Len(t, f.cu.Calls, 1, "should only call UpdateContainer once (error should stop subsequent calls)")
@@ -236,9 +237,9 @@ func TestUpdateMultipleContainersWithSameTarArchive(t *testing.T) {
 
 	cInfos := []store.ContainerInfo{cInfo1, cInfo2}
 	state := store.BuildState{
-		LastResult:        alreadyBuilt,
-		FilesChangedSet:   map[string]bool{"foo.py": true},
-		RunningContainers: cInfos,
+		LastSuccessfulResult: alreadyBuilt,
+		FilesChangedSet:      map[string]bool{"foo.py": true},
+		RunningContainers:    cInfos,
 	}
 
 	// Write files so we know whether to cp to or rm from container
@@ -254,7 +255,7 @@ func TestUpdateMultipleContainersWithSameTarArchive(t *testing.T) {
 		expectFile("src/planets/earth", "world"),
 	}
 
-	err := f.lubad.buildAndDeploy(f.ctx, f.cu, model.ImageTarget{}, state, paths, nil, true)
+	err := f.lubad.buildAndDeploy(f.ctx, f.ps, f.cu, model.ImageTarget{}, state, paths, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,9 +287,9 @@ func TestUpdateMultipleContainersWithSameTarArchiveOnRunStepFailure(t *testing.T
 
 	cInfos := []store.ContainerInfo{cInfo1, cInfo2}
 	state := store.BuildState{
-		LastResult:        alreadyBuilt,
-		FilesChangedSet:   map[string]bool{"foo.py": true},
-		RunningContainers: cInfos,
+		LastSuccessfulResult: alreadyBuilt,
+		FilesChangedSet:      map[string]bool{"foo.py": true},
+		RunningContainers:    cInfos,
 	}
 
 	// Write files so we know whether to cp to or rm from container
@@ -305,7 +306,7 @@ func TestUpdateMultipleContainersWithSameTarArchiveOnRunStepFailure(t *testing.T
 	}
 
 	f.cu.UpdateErrs = []error{rsf, rsf}
-	err := f.lubad.buildAndDeploy(f.ctx, f.cu, model.ImageTarget{}, state, paths, nil, true)
+	err := f.lubad.buildAndDeploy(f.ctx, f.ps, f.cu, model.ImageTarget{}, state, paths, nil, true)
 	require.NotNil(t, err)
 	assert.Contains(t, err.Error(), "Run step \"omgwtfbbq\" failed with exit code: 123")
 
@@ -317,19 +318,46 @@ func TestUpdateMultipleContainersWithSameTarArchiveOnRunStepFailure(t *testing.T
 	}
 }
 
+func TestSkipLiveUpdateIfForceUpdate(t *testing.T) {
+	f := newFixture(t)
+	defer f.teardown()
+
+	m := NewSanchoLiveUpdateManifest(f)
+
+	cInfo := store.ContainerInfo{
+		PodID:         "mypod",
+		ContainerID:   "cid1",
+		ContainerName: "container1",
+		Namespace:     "ns-foo",
+	}
+
+	state := store.BuildState{
+		LastSuccessfulResult: alreadyBuilt,
+		RunningContainers:    []store.ContainerInfo{cInfo},
+		ImageBuildTriggered:  true, // should make us skip LiveUpdate
+	}
+
+	stateSet := store.BuildStateSet{m.ImageTargetAt(0).ID(): state}
+
+	_, err := f.lubad.BuildAndDeploy(f.ctx, f.st, m.TargetSpecs(), stateSet)
+	require.NotNil(t, err)
+	assert.Contains(t, err.Error(), "Force update", "expected error contents not found")
+}
+
 type lcbadFixture struct {
 	*tempdir.TempDirFixture
 	t     testing.TB
 	ctx   context.Context
 	st    *store.Store
 	cu    *containerupdate.FakeContainerUpdater
+	ps    *build.PipelineState
 	lubad *LiveUpdateBuildAndDeployer
 }
 
 func newFixture(t testing.TB) *lcbadFixture {
 	// HACK(maia): we don't need any real container updaters on this LiveUpdBaD since we're testing
 	// a func further down the flow that takes a ContainerUpdater as an arg, so just pass nils
-	lubad := NewLiveUpdateBuildAndDeployer(nil, nil, nil, UpdateModeAuto, k8s.EnvDockerDesktop, container.RuntimeDocker)
+	lubad := NewLiveUpdateBuildAndDeployer(nil, nil, nil, buildcontrol.UpdateModeAuto, k8s.EnvDockerDesktop, container.RuntimeDocker, fakeClock{})
 	fakeContainerUpdater := &containerupdate.FakeContainerUpdater{}
 	ctx, _, _ := testutils.CtxAndAnalyticsForTest()
 	st, _ := store.NewStoreForTesting()
@@ -339,6 +367,7 @@ func newFixture(t testing.TB) *lcbadFixture {
 		st:             st,
 		ctx:            ctx,
 		cu:             fakeContainerUpdater,
+		ps:             build.NewPipelineState(ctx, 1, lubad.clock),
 		lubad:          lubad,
 	}
 }

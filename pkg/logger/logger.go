@@ -2,7 +2,6 @@ package logger
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"os"
 
@@ -22,15 +21,23 @@ import (
 // messages (like Infof) append a newline to the string before passing it to
 // Write().
 type Logger interface {
-	// log information that we always want to show
-	Infof(format string, a ...interface{})
-	// log information that a tilt user might not want to see on every run, but that they might find
-	// useful when debugging their Tiltfile/docker/k8s configs
-	Verbosef(format string, a ...interface{})
 	// log information that is likely to only be of interest to tilt developers
 	Debugf(format string, a ...interface{})
 
-	Write(level Level, s string)
+	// log information that a tilt user might not want to see on every run, but that they might find
+	// useful when debugging their Tiltfile/docker/k8s configs
+	Verbosef(format string, a ...interface{})
+
+	// log information that we always want to show
+	Infof(format string, a ...interface{})
+
+	// Warnings to show in the alert pane.
+	Warnf(format string, a ...interface{})
+
+	// Halting errors to show in the alert pane.
+	Errorf(format string, a ...interface{})
+
+	Write(level Level, bytes []byte)
 
 	// gets an io.Writer that filters to the specified level for, e.g., passing to a subprocess
 	Writer(level Level) io.Writer
@@ -38,17 +45,43 @@ type Logger interface {
 	Level() Level
 
 	SupportsColor() bool
+
+	WithFields(fields Fields) Logger
 }
 
-var _ Logger = logger{}
+type LogHandler interface {
+	Write(level Level, fields Fields, bytes []byte) error
+}
 
-type Level int
+type Level struct {
+	// UGH, for backwards-compatibility, the serialized value doesn't say anything
+	// about relative priority.
+	id int32
 
-const (
-	NoneLvl = iota
-	InfoLvl
-	VerboseLvl
-	DebugLvl
+	severity int32
+}
+
+func (l Level) ToProtoID() int32 {
+	return l.id
+}
+
+// If l is the logger level, determine if we should display
+// logs of the given severity.
+func (l Level) ShouldDisplay(log Level) bool {
+	return l.severity <= log.severity
+}
+
+func (l Level) AsSevereAs(log Level) bool {
+	return l.severity >= log.severity
+}
+
+var (
+	NoneLvl    = Level{id: 0, severity: 0}
+	DebugLvl   = Level{id: 3, severity: 100}
+	VerboseLvl = Level{id: 2, severity: 200}
+	InfoLvl    = Level{id: 1, severity: 300}
+	WarnLvl    = Level{id: 4, severity: 400}
+	ErrorLvl   = Level{id: 5, severity: 500}
 )
 
 const loggerContextKey = "Logger"
@@ -64,7 +97,7 @@ func Get(ctx context.Context) Logger {
 	panic("Called logger.Get(ctx) on a context with no logger attached!")
 }
 
-func NewLogger(level Level, writer io.Writer) Logger {
+func NewLogger(minLevel Level, writer io.Writer) Logger {
 	// adapted from fatih/color
 	supportsColor := true
 	if os.Getenv("TERM") == "dumb" {
@@ -76,76 +109,14 @@ func NewLogger(level Level, writer io.Writer) Logger {
 			supportsColor = isatty.IsTerminal(fd) || isatty.IsCygwinTerminal(fd)
 		}
 	}
-	return logger{level, writer, supportsColor}
+	return NewFuncLogger(supportsColor, minLevel, func(level Level, fields Fields, bytes []byte) error {
+		_, err := writer.Write(bytes)
+		return err
+	})
 }
 
 func WithLogger(ctx context.Context, logger Logger) context.Context {
 	return context.WithValue(ctx, loggerContextKey, logger)
-}
-
-type logger struct {
-	level         Level
-	writer        io.Writer
-	supportsColor bool
-}
-
-func (l logger) Level() Level {
-	return l.level
-}
-
-func (l logger) Infof(format string, a ...interface{}) {
-	l.writef(InfoLvl, format+"\n", a...)
-}
-
-func (l logger) Verbosef(format string, a ...interface{}) {
-	l.writef(VerboseLvl, format+"\n", a...)
-}
-
-func (l logger) Debugf(format string, a ...interface{}) {
-	l.writef(DebugLvl, format+"\n", a...)
-}
-
-func (l logger) writef(level Level, format string, a ...interface{}) {
-	if l.level >= level {
-		// swallowing errors because:
-		// 1) if we can't write to the log, what else are we going to do?
-		// 2) a logger interface that returns error becomes really distracting at call sites,
-		//    increasing friction and reducing logging
-		_, _ = fmt.Fprintf(l.writer, format, a...)
-	}
-}
-
-func (l logger) Write(level Level, s string) {
-	if l.level >= level {
-		// swallowing errors because:
-		// 1) if we can't write to the log, what else are we going to do?
-		// 2) a logger interface that returns error becomes really distracting at call sites,
-		//    increasing friction and reducing logging
-		_, _ = fmt.Fprintf(l.writer, s)
-	}
-}
-
-type levelWriter struct {
-	logger logger
-	level  Level
-}
-
-var _ io.Writer = levelWriter{}
-
-func (lw levelWriter) Write(p []byte) (n int, err error) {
-	if lw.logger.level >= lw.level {
-		return lw.logger.writer.Write(p)
-	} else {
-		return len(p), nil
-	}
-}
-
-func (l logger) Writer(level Level) io.Writer {
-	return levelWriter{l, level}
-}
-
-func (l logger) SupportsColor() bool {
-	return l.supportsColor
 }
 
 func getColor(l Logger, c color.Attribute) *color.Color {
@@ -161,14 +132,20 @@ func Yellow(l Logger) *color.Color { return getColor(l, color.FgYellow) }
 func Green(l Logger) *color.Color  { return getColor(l, color.FgGreen) }
 func Red(l Logger) *color.Color    { return getColor(l, color.FgRed) }
 
+func CtxWithLogHandler(ctx context.Context, handler LogHandler) context.Context {
+	original := Get(ctx)
+	newLogger := NewFuncLogger(original.SupportsColor(), original.Level(), handler.Write)
+	return WithLogger(ctx, newLogger)
+}
+
 // Returns a context containing a logger that forks all of its output
 // to both the parent context's logger and to the given `io.Writer`
 func CtxWithForkedOutput(ctx context.Context, writer io.Writer) context.Context {
 	l := Get(ctx)
 
-	write := func(level Level, b []byte) error {
-		l.Write(level, string(b))
-		if l.Level() >= level {
+	write := func(level Level, fields Fields, b []byte) error {
+		l.Write(level, b)
+		if l.Level().ShouldDisplay(level) {
 			b = append([]byte{}, b...)
 			_, err := writer.Write(b)
 			if err != nil {
@@ -178,11 +155,6 @@ func CtxWithForkedOutput(ctx context.Context, writer io.Writer) context.Context 
 		return nil
 	}
 
-	forkedLogger := funcLogger{
-		supportsColor: l.SupportsColor(),
-		level:         l.Level(),
-		write:         write,
-	}
-
+	forkedLogger := NewFuncLogger(l.SupportsColor(), l.Level(), write)
 	return WithLogger(ctx, forkedLogger)
 }

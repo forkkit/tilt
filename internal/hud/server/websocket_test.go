@@ -19,7 +19,7 @@ func TestWebsocketCloseOnReadErr(t *testing.T) {
 	st.SetUpSubscribersForTesting(ctx)
 
 	conn := newFakeConn()
-	ws := NewWebsocketSubscriber(conn)
+	ws := NewWebsocketSubscriber(ctx, conn)
 	st.AddSubscriber(ctx, ws)
 
 	done := make(chan bool)
@@ -45,7 +45,7 @@ func TestWebsocketReadErrDuringMsg(t *testing.T) {
 	st.SetUpSubscribersForTesting(ctx)
 
 	conn := newFakeConn()
-	ws := NewWebsocketSubscriber(conn)
+	ws := NewWebsocketSubscriber(ctx, conn)
 	st.AddSubscriber(ctx, ws)
 
 	done := make(chan bool)
@@ -70,6 +70,29 @@ func TestWebsocketReadErrDuringMsg(t *testing.T) {
 	conn.AssertClose(t, done)
 }
 
+func TestWebsocketNextWriterError(t *testing.T) {
+	ctx, _, _ := testutils.CtxAndAnalyticsForTest()
+	st, _ := store.NewStoreForTesting()
+	st.SetUpSubscribersForTesting(ctx)
+
+	conn := newFakeConn()
+	conn.nextWriterError = fmt.Errorf("fake NextWriter error")
+	ws := NewWebsocketSubscriber(ctx, conn)
+	st.AddSubscriber(ctx, ws)
+
+	done := make(chan bool)
+	go func() {
+		ws.Stream(ctx, st)
+		close(done)
+	}()
+
+	st.NotifySubscribers(ctx)
+	time.Sleep(10 * time.Millisecond)
+
+	conn.readCh <- fmt.Errorf("read error")
+	conn.AssertClose(t, done)
+}
+
 type fakeConn struct {
 	// Write an error to this channel to stop the Read consumer
 	readCh chan error
@@ -78,6 +101,8 @@ type fakeConn struct {
 	writeCh chan msg
 
 	closed bool
+
+	nextWriterError error
 }
 
 func newFakeConn() *fakeConn {
@@ -104,7 +129,7 @@ func (c *fakeConn) WriteJSON(v interface{}) error {
 
 func (c *fakeConn) AssertNextWriteMsg(t *testing.T) msg {
 	select {
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(150 * time.Millisecond):
 		t.Fatal("timed out waiting for WriteJSON")
 	case msg := <-c.writeCh:
 		return msg
@@ -119,6 +144,31 @@ func (c *fakeConn) AssertClose(t *testing.T, done chan bool) {
 	case <-done:
 		assert.True(t, c.closed)
 	}
+}
+
+func (c *fakeConn) NextWriter(messagetype int) (io.WriteCloser, error) {
+	if c.nextWriterError != nil {
+		return nil, c.nextWriterError
+	}
+	return c.writer(), nil
+}
+
+func (c *fakeConn) writer() io.WriteCloser {
+	return &fakeConnWriter{c: c}
+}
+
+type fakeConnWriter struct {
+	c *fakeConn
+}
+
+func (f *fakeConnWriter) Write(p []byte) (int, error) {
+	return len(p), nil
+}
+
+func (f *fakeConnWriter) Close() error {
+	cb := make(chan error)
+	f.c.writeCh <- msg{callback: cb}
+	return <-cb
 }
 
 type msg struct {

@@ -3,11 +3,12 @@ package store
 import (
 	"os"
 	"path/filepath"
-	"sort"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/windmilleng/tilt/internal/hud/view"
 	"github.com/windmilleng/tilt/internal/k8s/testyaml"
@@ -16,37 +17,28 @@ import (
 	"github.com/windmilleng/tilt/pkg/model"
 )
 
-func TestStateToViewMultipleSyncs(t *testing.T) {
+func TestStateToViewRelativeEditPaths(t *testing.T) {
 	m := model.Manifest{
 		Name: "foo",
-	}.WithImageTarget(model.ImageTarget{}.
-		WithBuildDetails(model.FastBuild{
-			Syncs: []model.Sync{
-				{LocalPath: "/a/b"},
-				{LocalPath: "/a/b/c"},
-			},
-		}),
-	)
+	}.WithDeployTarget(model.K8sTarget{}).WithImageTarget(model.ImageTarget{}.
+		WithBuildDetails(model.DockerBuild{BuildPath: "/a/b/c"}))
+
 	state := newState([]model.Manifest{m})
 	ms := state.ManifestTargets[m.Name].State
-	ms.CurrentBuild.Edits = []string{"/a/b/d", "/a/b/c/d/e"}
+	ms.CurrentBuild.Edits = []string{"/a/b/c/foo", "/a/b/c/d/e"}
 	ms.BuildHistory = []model.BuildRecord{
-		{Edits: []string{"/a/b/d", "/a/b/c/d/e"}},
+		{Edits: []string{"/a/b/c/foo", "/a/b/c/d/e"}},
 	}
 	ms.MutableBuildStatus(m.ImageTargets[0].ID()).PendingFileChanges =
-		map[string]time.Time{"/a/b/d": time.Now(), "/a/b/c/d/e": time.Now()}
-	v := StateToView(*state)
+		map[string]time.Time{"/a/b/c/foo": time.Now(), "/a/b/c/d/e": time.Now()}
+	v := StateToView(*state, &sync.RWMutex{})
 
-	if !assert.Equal(t, 2, len(v.Resources)) {
-		return
-	}
+	require.Len(t, v.Resources, 2)
 
 	r, _ := v.Resource(m.Name)
-	assert.Equal(t, []string{"d", "d/e"}, r.LastBuild().Edits)
-
-	sort.Strings(r.CurrentBuild.Edits)
-	assert.Equal(t, []string{"d", "d/e"}, r.CurrentBuild.Edits)
-	assert.Equal(t, []string{"d", "d/e"}, r.PendingBuildEdits)
+	assert.Equal(t, []string{"foo", "d/e"}, r.LastBuild().Edits)
+	assert.Equal(t, []string{"foo", "d/e"}, r.CurrentBuild.Edits)
+	assert.Equal(t, []string{"d/e", "foo"}, r.PendingBuildEdits) // these are sorted for deterministic ordering
 }
 
 func TestStateToViewPortForwards(t *testing.T) {
@@ -59,7 +51,7 @@ func TestStateToViewPortForwards(t *testing.T) {
 		},
 	})
 	state := newState([]model.Manifest{m})
-	v := StateToView(*state)
+	v := StateToView(*state, &sync.RWMutex{})
 	res, _ := v.Resource(m.Name)
 	assert.Equal(t,
 		[]string{"http://localhost:7000/", "http://localhost:8000/"},
@@ -70,7 +62,7 @@ func TestStateToViewUnresourcedYAMLManifest(t *testing.T) {
 	m, err := k8s.NewK8sOnlyManifestFromYAML(testyaml.SanchoYAML)
 	assert.NoError(t, err)
 	state := newState([]model.Manifest{m})
-	v := StateToView(*state)
+	v := StateToView(*state, &sync.RWMutex{})
 
 	assert.Equal(t, 2, len(v.Resources))
 

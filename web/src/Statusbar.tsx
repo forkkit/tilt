@@ -1,4 +1,4 @@
-import React, { Component, PureComponent, ReactElement } from "react"
+import React, { PureComponent, ReactElement } from "react"
 import { ReactComponent as LogoSvg } from "./assets/svg/logo.svg"
 import { ReactComponent as ErrorSvg } from "./assets/svg/error.svg"
 import { ReactComponent as WarningSvg } from "./assets/svg/warning.svg"
@@ -6,9 +6,12 @@ import { ReactComponent as UpdateAvailableSvg } from "./assets/svg/update-availa
 import { combinedStatus, warnings } from "./status"
 import "./Statusbar.scss"
 import { combinedStatusMessage } from "./combinedStatusMessage"
-import { Build, TiltBuild } from "./types"
+import { ResourceStatus } from "./types"
 import mostRecentBuildToDisplay from "./mostRecentBuild"
 import { Link } from "react-router-dom"
+
+type Build = Proto.webviewBuildRecord
+type TiltBuild = Proto.webviewTiltBuild
 
 class StatusItem {
   public warningCount: number = 0
@@ -27,28 +30,29 @@ class StatusItem {
    * Create a pared down StatusItem from a ResourceView
    */
   constructor(res: any) {
-    this.name = res.Name
+    this.name = res.name
     this.warningCount = warnings(res).length
 
     let status = combinedStatus(res)
-    this.up = status === "ok"
-    this.hasError = status === "error"
-    this.currentBuild = res.CurrentBuild
-    this.buildHistory = res.BuildHistory
-    this.lastBuild = res.BuildHistory ? res.BuildHistory[0] : null
-    this.podStatus = res.K8sResourceInfo && res.K8sResourceInfo.PodStatus
+    this.up = status === ResourceStatus.Healthy
+    this.hasError = status === ResourceStatus.Unhealthy
+    this.currentBuild = res.currentBuild
+    this.buildHistory = res.buildHistory
+    this.lastBuild = res.buildHistory ? res.buildHistory[0] : null
+    this.podStatus = res.k8sResourceInfo && res.k8sResourceInfo.podStatus
     this.podStatusMessage =
-      res.K8sResourceInfo && res.K8sResourceInfo.PodStatusMessage
-    this.pendingBuildSince = res.PendingBuildSince
-    this.pendingBuildEdits = res.PendingBuildEdits
+      res.k8sResourceInfo && res.k8sResourceInfo.podStatusMessage
+    this.pendingBuildSince = res.pendingBuildSince
+    this.pendingBuildEdits = res.pendingBuildEdits
   }
 }
 
 type StatusBarProps = {
   items: Array<StatusItem>
   alertsUrl: string
-  runningVersion: TiltBuild | null
-  latestVersion: TiltBuild | null
+  runningVersion: TiltBuild | null | undefined
+  latestVersion: TiltBuild | null | undefined
+  checkVersion: boolean
 }
 
 class Statusbar extends PureComponent<StatusBarProps> {
@@ -97,39 +101,61 @@ class Statusbar extends PureComponent<StatusBarProps> {
     )
   }
 
-  statusMessagePanel(build: any, editMessage: string) {
+  statusMessagePanel(build: any, edits: string) {
+    let lastEdit = <span>—</span>
+    if (build && edits) {
+      lastEdit = (
+        <span>
+          <span className="LastEditStatus-name" data-tip={edits}>
+            {build.name}
+          </span>
+          <span className="LastEditStatus-details">{" ‣ " + edits}</span>
+        </span>
+      )
+    }
     return (
       <section className="Statusbar-panel Statusbar-statusMsgPanel">
-        <p className="Statusbar-statusMsgPanel-child">
-          {combinedStatusMessage(this.props.items)}
-        </p>
-        <p className="Statusbar-statusMsgPanel-child Statusbar-statusMsgPanel-child--lastEdit">
-          <span className="Statusbar-statusMsgPanel-label">Last Edit:</span>
-          <span>{build ? editMessage : "—"}</span>
-        </p>
+        <div>{combinedStatusMessage(this.props.items)}</div>
+        <div className="LastEditStatus">
+          <span className="LastEditStatus-label">Last Edit:</span>
+          {lastEdit}
+        </div>
       </section>
     )
   }
 
-  tiltPanel(runningVersion: TiltBuild | null, latestVersion: TiltBuild | null) {
+  tiltPanel(
+    runningVersion: TiltBuild | null | undefined,
+    latestVersion: TiltBuild | null | undefined,
+    shouldCheckVersion: boolean
+  ) {
     let content: ReactElement = <LogoSvg className="Statusbar-logo" />
     if (
+      shouldCheckVersion &&
       latestVersion &&
-      latestVersion.Version &&
+      latestVersion.version &&
       runningVersion &&
-      runningVersion.Version &&
-      !runningVersion.Dev &&
-      runningVersion.Version != latestVersion.Version
+      runningVersion.version &&
+      !runningVersion.dev &&
+      runningVersion.version !== latestVersion.version
     ) {
       content = (
         <a
           href="https://docs.tilt.dev/upgrade.html"
           className="Statusbar-tiltPanel-link"
           target="_blank"
+          rel="noopener noreferrer"
         >
           <p className="Statusbar-tiltPanel-upgradeTooltip">
-            ✨ Get Tilt v{latestVersion.Version}! ✨<br />
-            (You're running v{runningVersion.Version})
+            <span role="img" aria-label="Decorative sparkling stars">
+              ✨
+            </span>
+            Get Tilt v{latestVersion.version}!{" "}
+            <span role="img" aria-label="Decorative sparkling stars">
+              ✨
+            </span>
+            <br />
+            (You're running v{runningVersion.version})
           </p>
           {content}
           <UpdateAvailableSvg />
@@ -160,9 +186,9 @@ class Statusbar extends PureComponent<StatusBarProps> {
     let build = mostRecentBuildToDisplay(this.props.items)
     let editMessage = ""
     if (build && build.edits.length > 0) {
-      editMessage = `${build.name} ‣ ${build.edits[0]}`
+      editMessage = `${build.edits[0]}`
       if (build.edits.length > 1) {
-        editMessage += `[+${build.edits.length - 1} more]`
+        editMessage += `[+ ${build.edits.length - 1} more]`
       }
     }
     let statusMessagePanel = this.statusMessagePanel(build, editMessage)
@@ -172,7 +198,8 @@ class Statusbar extends PureComponent<StatusBarProps> {
 
     let tiltPanel = this.tiltPanel(
       this.props.runningVersion,
-      this.props.latestVersion
+      this.props.latestVersion,
+      this.props.checkVersion
     )
 
     return (

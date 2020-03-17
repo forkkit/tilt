@@ -2,25 +2,24 @@ package model
 
 import (
 	"fmt"
-	"path/filepath"
-	"reflect"
 	"sort"
-
-	"github.com/docker/distribution/reference"
 
 	"github.com/windmilleng/tilt/internal/container"
 	"github.com/windmilleng/tilt/internal/sliceutils"
 )
 
 type ImageTarget struct {
-	ConfigurationRef container.RefSelector
-	DeploymentRef    reference.Named
-	BuildDetails     BuildDetails
-	MatchInEnvVars   bool
+	Refs           container.RefSet
+	BuildDetails   BuildDetails
+	MatchInEnvVars bool
 
 	// User-supplied command to run when the container runs
 	// (i.e. overrides k8s yaml "command", container ENTRYPOINT, etc.)
 	OverrideCmd Cmd
+
+	// User-supplied args override when the container runs.
+	// (i.e. overrides k8s yaml "args")
+	OverrideArgs OverrideArgs
 
 	cachePaths []string
 
@@ -33,14 +32,21 @@ type ImageTarget struct {
 	dependencyIDs []TargetID
 }
 
-func NewImageTarget(ref container.RefSelector) ImageTarget {
-	return ImageTarget{ConfigurationRef: ref, DeploymentRef: ref.AsNamedOnly()}
+// Represent OverrideArgs as a special struct, to cleanly distinguish
+// "replace with 0 args" from "don't replace"
+type OverrideArgs struct {
+	ShouldOverride bool
+	Args           []string
+}
+
+func MustNewImageTarget(ref container.RefSelector) ImageTarget {
+	return ImageTarget{Refs: container.MustSimpleRefSet(ref)}
 }
 
 func ImageID(ref container.RefSelector) TargetID {
 	name := TargetName("")
 	if !ref.Empty() {
-		name = TargetName(ref.String())
+		name = TargetName(container.FamiliarString(ref))
 	}
 	return TargetID{
 		Type: TargetTypeImage,
@@ -49,7 +55,7 @@ func ImageID(ref container.RefSelector) TargetID {
 }
 
 func (i ImageTarget) ID() TargetID {
-	return ImageID(i.ConfigurationRef)
+	return ImageID(i.Refs.ConfigurationRef)
 }
 
 func (i ImageTarget) DependencyIDs() []TargetID {
@@ -62,25 +68,19 @@ func (i ImageTarget) WithDependencyIDs(ids []TargetID) ImageTarget {
 }
 
 func (i ImageTarget) Validate() error {
-	if i.ConfigurationRef.Empty() {
+	confRef := i.Refs.ConfigurationRef
+	if confRef.Empty() {
 		return fmt.Errorf("[Validate] Image target missing image ref: %+v", i.BuildDetails)
+	}
+
+	if err := i.Refs.Validate(); err != nil {
+		return fmt.Errorf("[Validate] Image %q refset failed validation: %v", confRef, err)
 	}
 
 	switch bd := i.BuildDetails.(type) {
 	case DockerBuild:
 		if bd.BuildPath == "" {
-			return fmt.Errorf("[Validate] Image %q missing build path", i.ConfigurationRef)
-		}
-	case FastBuild:
-		if bd.BaseDockerfile == "" {
-			return fmt.Errorf("[Validate] Image %q missing base dockerfile", i.ConfigurationRef)
-		}
-
-		for _, mnt := range bd.Syncs {
-			if !filepath.IsAbs(mnt.LocalPath) {
-				return fmt.Errorf(
-					"[Validate] Image %q: mount must be an absolute path (got: %s)", i.ConfigurationRef, mnt.LocalPath)
-			}
+			return fmt.Errorf("[Validate] Image %q missing build path", confRef)
 		}
 	case CustomBuild:
 		if bd.Command == "" {
@@ -89,10 +89,18 @@ func (i ImageTarget) Validate() error {
 			)
 		}
 	default:
-		return fmt.Errorf("[Validate] Image %q has neither DockerBuildInfo nor FastBuildInfo", i.ConfigurationRef)
+		return fmt.Errorf("[Validate] Image %q has neither DockerBuild nor "+
+			"CustomBuild details", confRef)
 	}
 
 	return nil
+}
+
+// HasDistinctClusterRef indicates whether the image target has a ClusterRef
+// distinct from LocalRef, i.e. if the image is addressed different from
+// inside and outside the cluster.
+func (i ImageTarget) HasDistinctClusterRef() bool {
+	return i.Refs.LocalRef().String() != i.Refs.ClusterRef().String()
 }
 
 type BuildDetails interface {
@@ -109,7 +117,7 @@ func (i ImageTarget) IsDockerBuild() bool {
 	return ok
 }
 
-func (i ImageTarget) AnyLiveUpdateInfo() LiveUpdate {
+func (i ImageTarget) LiveUpdateInfo() LiveUpdate {
 	switch details := i.BuildDetails.(type) {
 	case DockerBuild:
 		return details.LiveUpdate
@@ -118,32 +126,6 @@ func (i ImageTarget) AnyLiveUpdateInfo() LiveUpdate {
 	default:
 		return LiveUpdate{}
 	}
-}
-
-func (i ImageTarget) AnyFastBuildInfo() FastBuild {
-	switch details := i.BuildDetails.(type) {
-	case FastBuild:
-		return details
-	case DockerBuild:
-		return details.FastBuild
-	case CustomBuild:
-		return details.Fast
-	}
-	return FastBuild{}
-}
-
-// FastBuildInfo returns the TOP LEVEL BUILD DETAILS, if a FastBuild.
-// Does not return nested FastBuild details.
-func (i ImageTarget) TopFastBuildInfo() FastBuild {
-	ret, _ := i.BuildDetails.(FastBuild)
-	return ret
-}
-
-// IsFastBuild checks if the TOP LEVEL BUILD DETAILS are for a FastBuild.
-// (If this target is a DockerBuild || CustomBuild with a nested FastBuild, returns FALSE.)
-func (i ImageTarget) IsFastBuild() bool {
-	_, ok := i.BuildDetails.(FastBuild)
-	return ok
 }
 
 func (i ImageTarget) CustomBuildInfo() CustomBuild {
@@ -194,12 +176,6 @@ func (i ImageTarget) LocalPaths() []string {
 	switch bd := i.BuildDetails.(type) {
 	case DockerBuild:
 		return []string{bd.BuildPath}
-	case FastBuild:
-		result := make([]string, len(bd.Syncs))
-		for i, mount := range bd.Syncs {
-			result[i] = mount.LocalPath
-		}
-		return result
 	case CustomBuild:
 		return append([]string(nil), bd.Deps...)
 	}
@@ -241,9 +217,27 @@ type DockerBuild struct {
 	Dockerfile  string
 	BuildPath   string // the absolute path to the files
 	BuildArgs   DockerBuildArgs
-	FastBuild   FastBuild  // Optionally, can use FastBuild to update this build in place.
 	LiveUpdate  LiveUpdate // Optionally, can use LiveUpdate to update this build in place.
 	TargetStage DockerBuildTarget
+
+	// Pass SSH secrets to docker so it can clone private repos.
+	// https://docs.docker.com/develop/develop-images/build_enhancements/#using-ssh-to-access-private-data-in-builds
+	SSHSpecs []string
+
+	// Pass secrets to docker
+	// https://docs.docker.com/develop/develop-images/build_enhancements/#new-docker-build-secret-information
+	SecretSpecs []string
+
+	Network string
+
+	// By default, Tilt creates a new temporary image reference for each build.
+	// The user can also specify their own reference, to integrate with other tooling
+	// (like build IDs for Jenkins build pipelines)
+	//
+	// Equivalent to the docker build --tag flag.
+	// Named 'tag' for consistency with how it's used throughout the docker API,
+	// even though this is really more like a reference.NamedTagged
+	ExtraTags []string
 }
 
 func (DockerBuild) buildDetails() {}
@@ -252,21 +246,8 @@ type DockerBuildTarget string
 
 func (s DockerBuildTarget) String() string { return string(s) }
 
-type FastBuild struct {
-	BaseDockerfile string
-	Syncs          []Sync
-	Runs           []Run
-	Entrypoint     Cmd
-
-	// A HotReload container image knows how to automatically
-	// reload any changes in the container. No need to restart it.
-	HotReload bool
-}
-
-func (FastBuild) buildDetails()  {}
-func (fb FastBuild) Empty() bool { return reflect.DeepEqual(fb, FastBuild{}) }
-
 type CustomBuild struct {
+	WorkDir string
 	Command string
 	// Deps is a list of file paths that are dependencies of this command.
 	Deps []string
@@ -277,9 +258,9 @@ type CustomBuild struct {
 	// export $EXPECTED_REF=name:expected_tag )
 	Tag string
 
-	Fast        FastBuild
-	LiveUpdate  LiveUpdate // Optionally, can use LiveUpdate to update this build in place.
-	DisablePush bool
+	LiveUpdate       LiveUpdate // Optionally, can use LiveUpdate to update this build in place.
+	DisablePush      bool
+	SkipsLocalDocker bool
 }
 
 func (CustomBuild) buildDetails() {}
@@ -287,6 +268,10 @@ func (CustomBuild) buildDetails() {}
 func (cb CustomBuild) WithTag(t string) CustomBuild {
 	cb.Tag = t
 	return cb
+}
+
+func (cb CustomBuild) SkipsPush() bool {
+	return cb.SkipsLocalDocker || cb.DisablePush
 }
 
 var _ TargetSpec = ImageTarget{}

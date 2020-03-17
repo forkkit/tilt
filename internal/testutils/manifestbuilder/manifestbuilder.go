@@ -26,7 +26,9 @@ type ManifestBuilder struct {
 	k8sPodSelectors []labels.Selector
 	dcConfigPaths   []string
 	localCmd        string
+	localServeCmd   string
 	localDeps       []string
+	resourceDeps    []string
 
 	iTargets []model.ImageTarget
 }
@@ -56,6 +58,11 @@ func (b ManifestBuilder) WithDockerCompose() ManifestBuilder {
 func (b ManifestBuilder) WithLocalResource(cmd string, deps []string) ManifestBuilder {
 	b.localCmd = cmd
 	b.localDeps = deps
+	return b
+}
+
+func (b ManifestBuilder) WithLocalServeCmd(cmd string) ManifestBuilder {
+	b.localServeCmd = cmd
 	return b
 }
 
@@ -92,17 +99,27 @@ func (b ManifestBuilder) WithLiveUpdateAtIndex(lu model.LiveUpdate, index int) M
 	return b
 }
 
+func (b ManifestBuilder) WithResourceDeps(deps ...string) ManifestBuilder {
+	b.resourceDeps = deps
+	return b
+}
+
 func (b ManifestBuilder) Build() model.Manifest {
+	var rds []model.ManifestName
+	for _, dep := range b.resourceDeps {
+		rds = append(rds, model.ManifestName(dep))
+	}
+
 	if b.k8sYAML != "" {
 		return assembleK8s(
-			model.Manifest{Name: b.name},
+			model.Manifest{Name: b.name, ResourceDependencies: rds},
 			model.K8sTarget{YAML: b.k8sYAML, ExtraPodSelectors: b.k8sPodSelectors},
 			b.iTargets...)
 	}
 
 	if len(b.dcConfigPaths) > 0 {
 		return assembleDC(
-			model.Manifest{Name: b.name},
+			model.Manifest{Name: b.name, ResourceDependencies: rds},
 			model.DockerComposeTarget{
 				Name:        model.TargetName(b.name),
 				ConfigPaths: b.dcConfigPaths,
@@ -110,9 +127,14 @@ func (b ManifestBuilder) Build() model.Manifest {
 			b.iTargets...)
 	}
 
-	if b.localCmd != "" {
-		lt := model.NewLocalTarget(model.TargetName(b.name), model.ToShellCmd(b.localCmd), b.f.Path(), b.localDeps)
-		return model.Manifest{Name: b.name}.WithDeployTarget(lt)
+	if b.localCmd != "" || b.localServeCmd != "" {
+		lt := model.NewLocalTarget(
+			model.TargetName(b.name),
+			model.ToShellCmd(b.localCmd),
+			model.ToShellCmd(b.localServeCmd),
+			b.localDeps,
+			b.f.Path())
+		return model.Manifest{Name: b.name, ResourceDependencies: rds}.WithDeployTarget(lt)
 	}
 
 	b.f.T().Fatalf("No deploy target specified: %s", b.name)

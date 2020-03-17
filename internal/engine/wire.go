@@ -8,8 +8,10 @@ import (
 
 	"github.com/google/wire"
 	"github.com/windmilleng/wmclient/pkg/dirs"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
 	"github.com/windmilleng/tilt/internal/containerupdate"
+	"github.com/windmilleng/tilt/internal/engine/buildcontrol"
 	"github.com/windmilleng/tilt/internal/synclet"
 	"github.com/windmilleng/tilt/internal/synclet/sidecar"
 
@@ -20,7 +22,7 @@ import (
 	"github.com/windmilleng/tilt/internal/dockerfile"
 	"github.com/windmilleng/tilt/internal/k8s"
 	"github.com/windmilleng/tilt/internal/minikube"
-	"github.com/windmilleng/tilt/pkg/logger"
+	"github.com/windmilleng/tilt/internal/tracer"
 )
 
 var DeployerBaseWireSet = wire.NewSet(
@@ -31,10 +33,9 @@ var DeployerBaseWireSet = wire.NewSet(
 	sidecar.WireSet,
 	minikube.ProvideMinikubeClient,
 	build.DefaultImageBuilder,
-	build.NewCacheBuilder,
 	build.NewDockerImageBuilder,
 	build.NewExecCustomBuilder,
-	wire.Bind(new(build.CustomBuilder), new(build.ExecCustomBuilder)),
+	wire.Bind(new(build.CustomBuilder), new(*build.ExecCustomBuilder)),
 
 	// BuildOrder
 	NewLocalTargetBuildAndDeployer,
@@ -47,14 +48,17 @@ var DeployerBaseWireSet = wire.NewSet(
 	NewImageAndCacheBuilder,
 	DefaultBuildOrder,
 
-	wire.Bind(new(BuildAndDeployer), new(CompositeBuildAndDeployer)),
+	tracer.InitOpenTelemetry,
+
+	wire.Bind(new(BuildAndDeployer), new(*CompositeBuildAndDeployer)),
 	NewCompositeBuildAndDeployer,
-	ProvideUpdateMode,
+	buildcontrol.ProvideUpdateMode,
 )
 
 var DeployerWireSetTest = wire.NewSet(
 	DeployerBaseWireSet,
 	containerupdate.NewSyncletManagerForTests,
+	wire.InterfaceValue(new(sdktrace.SpanProcessor), (sdktrace.SpanProcessor)(nil)),
 
 	// A fake synclet wrapped in a GRPC interface
 	synclet.FakeGRPCWrapper,
@@ -71,11 +75,11 @@ func provideBuildAndDeployer(
 	kClient k8s.Client,
 	dir *dirs.WindmillDir,
 	env k8s.Env,
-	updateMode UpdateModeFlag,
+	updateMode buildcontrol.UpdateModeFlag,
 	sCli *synclet.TestSyncletClient,
 	dcc dockercompose.DockerComposeClient,
 	clock build.Clock,
-	kp KINDPusher,
+	kp KINDLoader,
 	analytics *analytics.TiltAnalytics) (BuildAndDeployer, error) {
 	wire.Build(
 		DeployerWireSetTest,
@@ -92,11 +96,11 @@ func provideImageBuildAndDeployer(
 	env k8s.Env,
 	dir *dirs.WindmillDir,
 	clock build.Clock,
-	kp KINDPusher,
+	kp KINDLoader,
 	analytics *analytics.TiltAnalytics) (*ImageBuildAndDeployer, error) {
 	wire.Build(
 		DeployerWireSetTest,
-		wire.Value(UpdateModeFlag(UpdateModeAuto)),
+		wire.Value(buildcontrol.UpdateModeFlag(buildcontrol.UpdateModeAuto)),
 		k8s.ProvideContainerRuntime,
 	)
 
@@ -104,7 +108,7 @@ func provideImageBuildAndDeployer(
 }
 
 func provideKubectlLogLevelInfo() k8s.KubectlLogLevel {
-	return k8s.KubectlLogLevel(logger.InfoLvl)
+	return k8s.KubectlLogLevel(0)
 }
 
 func provideDockerComposeBuildAndDeployer(
@@ -114,7 +118,7 @@ func provideDockerComposeBuildAndDeployer(
 	dir *dirs.WindmillDir) (*DockerComposeBuildAndDeployer, error) {
 	wire.Build(
 		DeployerWireSetTest,
-		wire.Value(UpdateModeFlag(UpdateModeAuto)),
+		wire.Value(buildcontrol.UpdateModeFlag(buildcontrol.UpdateModeAuto)),
 		build.ProvideClock,
 		provideKubectlLogLevelInfo,
 

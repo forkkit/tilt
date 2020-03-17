@@ -80,6 +80,37 @@ RUN echo bye
 `)
 }
 
+func TestPrintSyntaxDirective(t *testing.T) {
+	assertPrintSame(t, `# syntax = foobarbaz
+
+FROM golang:10
+RUN echo hi
+RUN echo bye
+`)
+}
+
+func TestMultipleDirectivesOrderDeterministic(t *testing.T) {
+	orig := `# z = zzz
+# y = yyy
+# x = xxx
+# b = bbb
+# a = aaa
+
+FROM golang:10
+`
+	// directives should be sorted alphabetically by key-
+	expected := `# a = aaa
+# b = bbb
+# x = xxx
+# y = yyy
+# z = zzz
+
+FROM golang:10
+`
+
+	assertPrint(t, orig, expected)
+}
+
 // Convert the dockerfile into an AST, print it, and then
 // assert that the result is the same as the original.
 func assertPrintSame(t *testing.T, original string) {

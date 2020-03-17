@@ -1,4 +1,5 @@
 @import "constants";
+@import "animations";
 
 .Sidebar {
   position: fixed;
@@ -6,8 +7,7 @@
   right: 0;
   bottom: $statusbar-height;
   width: $sidebar-width;
-  background-color: $color-gray-dark;
-  border-left: 1px solid $color-gray-light;
+  background-color: $color-gray-darkest;
   box-sizing: border-box;
   overflow-y: auto;
   transform: translateX(0%);
@@ -15,134 +15,16 @@
   font-size: $font-size;
   display: flex;
   flex-direction: column;
-  box-shadow: -1px 0px 6px 0px $color-gray-darkest;
   z-index: $z-sidebar;
 }
 .Sidebar.is-closed {
   transform: translateX(calc(100% - #{$sidebar-collapsed-width}));
 }
 
-// Resource List
-.Sidebar-resources {
-  flex: 1 0 auto;
-  font-weight: bold;
-}
-.Sidebar-list {
-  list-style: none;
-}
-
-.resLink {
-  right: 0;
-  border-bottom: 1px solid rgba($color-gray-lightest, $translucent);
-  color: $color-white;
-  background-color: $color-gray;
-  text-decoration: none;
-  display: flex;
-  align-items: center;
-  height: $sidebar-item;
-  transition-property: color;
-  transition-duration: $animation-timing;
-  transition-timing-function: linear;
-}
-.resLink:hover {
-  background-color: rgba($color-gray-dark, $translucent);
-  color: $color-blue-light;
-}
-.resLink.is-selected {
-  background-color: $color-white;
-  color: $color-gray;
-}
-
-.resLink--building {
-  background: repeating-linear-gradient(
-    225deg,
-    rgba($color-gray-light, $translucent),
-    rgba($color-gray-light, $translucent) 1px,
-    rgba(0, 0, 0, 0) 1px,
-    rgba(0, 0, 0, 0) 6px
-  );
-  background-size: 200% 200%;
-  animation: barberpole 8s linear infinite;
-}
-
-.resLink--all::before {
-  content: "┌";
-  color: $color-gray-light;
-  margin-top: $spacing-unit / 4; // Visually center
-  width: $sidebar-item;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.resLink--all-name {
-  text-transform: uppercase;
-  flex: 1;
-}
-
-.sidebarIcon {
-  width: $sidebar-item;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.resLink-name {
-  flex: 1;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.resLink-alertBadge {
-  font-family: $font-sans-serif;
-  font-size: $font-size-smallest;
-  background-color: $color-white;
-  color: $color-gray-darkest;
-  border-radius: $alert-badge;
-  width: $alert-badge;
-  height: $alert-badge;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  margin-right: $spacing-unit / 2;
-}
-
-.resLink.is-selected .resLink-alertBadge {
-  background-color: $color-gray-darkest;
-  color: $color-white;
-}
-
-.resLink-timeAgo {
-  min-width: $spacing-unit * 0.8;
-  text-align: right;
-  font-weight: normal;
-  color: rgba($color-white, $translucent-ish);
-}
-
-.resLink.is-selected .resLink-timeAgo {
-  color: $color-gray;
-}
-
-.resLink-timeAgo.empty {
-  color: rgba($color-white, $translucent) !important;
-}
-
-.resLink-isDirty {
-  min-width: $spacing-unit * 0.8;
-  text-align: center;
-}
-
 // Collapse/Expand
-.Sidebar-spacer {
-  flex-grow: 1;
-  height: 0;
-}
-
 .Sidebar-toggle {
-  background-color: $color-gray;
+  background-color: $color-gray-darkest;
   border: 0 none;
-  border-top: 1px solid $color-gray-light;
   color: inherit;
   font-size: inherit;
   font-family: inherit;
@@ -158,12 +40,11 @@
   transition-timing-function: ease;
 }
 .Sidebar-toggle:hover {
-  background-color: $color-gray-dark;
   color: $color-blue-light;
 }
 .Sidebar-toggle > svg {
   fill: $color-white;
-  width: $spacing-unit * 1.5;
+  width: $sidebar-collapsed-width;
   transition: transform $animation-timing ease-in, fill $animation-timing ease;
 }
 .Sidebar-toggle:hover > svg {
@@ -171,32 +52,4 @@
 }
 .Sidebar.is-closed .Sidebar-toggle > svg {
   transform: rotate(180deg);
-}
-
-// Animations
-@keyframes spin {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-@keyframes glow {
-  0% {
-    fill-opacity: $translucent;
-  }
-  50% {
-    fill-opacity: $translucent-ish;
-  }
-  100% {
-    fill-opacity: $translucent;
-  }
-}
-
-@keyframes barberpole {
-  100% {
-    background-position: 100% 100%;
-  }
 }

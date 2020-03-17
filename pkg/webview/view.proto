@@ -1,0 +1,246 @@
+syntax = "proto3";
+
+package webview;
+
+import "google/api/annotations.proto";
+import "google/protobuf/timestamp.proto";
+import "pkg/webview/log.proto";
+
+option go_package = "github.com/windmilleng/tilt/pkg/webview";
+
+// Correspond to BuildAndDeployers
+enum UpdateType {
+  UPDATE_TYPE_UNSPECIFIED = 0;
+  UPDATE_TYPE_IMAGE = 1;
+  UPDATE_TYPE_LIVE_UPDATE = 2;
+  UPDATE_TYPE_DOCKER_COMPOSE = 3;
+  UPDATE_TYPE_K8S = 4;
+  UPDATE_TYPE_LOCAL = 5;
+}
+
+// Correspond to implementations of the TargetSpec interface
+enum TargetType {
+  TARGET_TYPE_UNSPECIFIED = 0;
+  TARGET_TYPE_IMAGE = 1;
+  TARGET_TYPE_K8S = 2;
+  TARGET_TYPE_DOCKER_COMPOSE = 3;
+  TARGET_TYPE_LOCAL = 4;
+}
+
+message TargetSpec {
+  string id = 1;
+  TargetType type = 2;
+  bool has_live_update = 3;
+}
+
+message BuildRecord {
+  repeated string edits = 1;
+  string error = 2;
+  repeated string warnings = 3;
+  google.protobuf.Timestamp start_time = 4;
+  google.protobuf.Timestamp finish_time  = 5;
+
+  repeated UpdateType update_types = 9;
+
+  reserved "log";
+  reserved 6;
+
+  bool is_crash_rebuild = 7;
+
+  // The span id for this build record's logs in the main logstore.
+  string span_id = 8;
+}
+
+message K8sResourceInfo {
+  string pod_name = 1;
+  string pod_creation_time = 2;
+  string pod_update_start_time = 3;
+  string pod_status = 4;
+  string pod_status_message = 5;
+  bool all_containers_ready = 6;
+  int32 pod_restarts = 7;
+
+  // pod logs are now in the log store
+  reserved "pod_log";
+  reserved 8;
+
+  // The span id for this pod's logs in the main logstore
+  string span_id = 9;
+}
+
+message DCResourceInfo {
+  repeated string config_paths = 1;
+  string container_status = 2;
+  string containerID = 3;
+
+  // service logs are now in the log store
+  reserved "log";
+  reserved 4;
+
+  google.protobuf.Timestamp start_time = 5;
+
+  // The span id for this docker-compose service's logs in the main logstore
+  string span_id = 6;
+}
+
+message YAMLResourceInfo {
+  repeated string k8s_resources = 1;
+}
+
+message LocalResourceInfo {
+     int64 pid = 1;
+}
+
+message Facet {
+  string name = 1;
+  string value = 2;
+
+  // If span_id is non-empty, that means the value is in the logstore
+  // instead of in the value field.
+  string span_id = 3;
+}
+
+message Resource {
+  string name = 1;
+  repeated string directories_watched = 2;
+  repeated string paths_watched = 3;
+  google.protobuf.Timestamp last_deploy_time = 4;
+  int32 trigger_mode = 5;
+  repeated BuildRecord build_history = 6;
+  BuildRecord current_build = 7;
+  int32 pending_build_reason = 8;
+  repeated string pending_build_edits = 9;
+  google.protobuf.Timestamp pending_build_since = 10;
+  bool has_pending_changes = 11;
+  repeated string endpoints = 12;
+  string podID = 13;
+  K8sResourceInfo k8s_resource_info = 14;
+  DCResourceInfo dc_resource_info = 15;
+  YAMLResourceInfo yaml_resource_info = 16;
+  LocalResourceInfo local_resource_info = 17;
+  string runtime_status = 18;
+  bool is_tiltfile = 19;
+  repeated TargetSpec specs = 27;
+  bool show_build_status = 20;
+
+  // Resource logs are now stored in the log store.
+  reserved "combined_log";
+  reserved 21;
+
+  // Obsoleted by crash_log_span_id.
+  string crash_log = 22;
+
+  // A span id for the log that crashed.
+  string crash_log_span_id = 26;
+
+  // Alerts are currently client-side only, and not
+  // sent in the payload.
+  reserved "alerts";
+  reserved 23;
+
+  repeated Facet facets = 24;
+  bool queued = 25;
+}
+
+message TiltBuild {
+  string version = 1;
+  string commitSHA = 2;
+  string date = 3;
+  bool dev = 4;
+}
+
+message VersionSettings {
+  bool check_updates = 1;
+}
+
+message View {
+  string log = 1;
+  repeated Resource resources = 2;
+
+  // We used to have a setting that allowed users to dynamically
+  // prepend timestamps in logs.
+  bool DEPRECATED_log_timestamps = 3;
+
+  map<string, bool> feature_flags = 4;
+
+  bool needs_analytics_nudge = 5;
+
+  TiltBuild running_tilt_build = 6;
+  TiltBuild latest_tilt_build = 7;
+  VersionSettings version_settings = 12;
+
+  string tilt_cloud_username = 8;
+  string tilt_cloud_schemeHost = 9;
+  string tilt_cloud_teamID = 10;
+
+  string fatal_error = 11;
+
+  LogList log_list = 13;
+
+  // Allows us to synchronize on a running Tilt intance,
+  // so we can tell when Tilt restarted.
+  google.protobuf.Timestamp tilt_start_time = 14;
+}
+
+message GetViewRequest {}
+
+message SnapshotHighlight {
+  string beginning_logID = 1;
+  string ending_logID = 2;
+  string text = 3;
+}
+
+message Snapshot {
+  View view = 1;
+  bool is_sidebar_closed = 2;
+  string path = 3;
+  SnapshotHighlight snapshot_highlight = 4;
+  string snapshot_link = 5;
+}
+
+message UploadSnapshotResponse {
+  string url = 1;
+}
+
+// The webclient needs to notify the server what logs it has,
+// so the server knows what to send.
+//
+// The socket protocol doesn't have any concept of a StatusCode
+// to confirm that the receiver got the message, so we need to send this
+// in a separate message.
+message AckWebsocketRequest {
+  // The to_checkpoint on the received LogList
+  int32 to_checkpoint = 1;
+
+  // Allows us to synchronize on a running Tilt intance,
+  // so we can tell when we're talking to the same Tilt.
+  google.protobuf.Timestamp tilt_start_time = 2;
+}
+
+message AckWebsocketResponse {}
+
+// These services need to be here for the generated TS to be generated
+service ViewService {
+  rpc GetView(GetViewRequest) returns (View) {
+    option (google.api.http) = {
+      get: "/api/view"
+    };
+  }
+
+  rpc UploadSnapshot(Snapshot) returns (UploadSnapshotResponse) {
+    option (google.api.http) = {
+      post: "/api/snapshot/new"
+      body: "*"
+    };
+  }
+}
+
+// This is a fake service, so that we do codegen for the websocket protocol messages.
+service WebsocketService {
+  rpc AckWebsocket(AckWebsocketRequest) returns (AckWebsocketResponse) {
+    option (google.api.http) = {
+     post: "/websocket/ack"
+      body: "*"
+    };
+  }
+}

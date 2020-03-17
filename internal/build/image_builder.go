@@ -18,6 +18,8 @@ import (
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 
+	"github.com/windmilleng/tilt/internal/container"
+
 	"github.com/windmilleng/tilt/internal/docker"
 	"github.com/windmilleng/tilt/internal/dockerfile"
 	"github.com/windmilleng/tilt/internal/ignore"
@@ -36,11 +38,9 @@ type dockerImageBuilder struct {
 }
 
 type ImageBuilder interface {
-	BuildImage(ctx context.Context, ps *PipelineState, ref reference.Named, df dockerfile.Dockerfile, buildPath string, filter model.PathMatcher, buildArgs map[string]string,
-		targetStage model.DockerBuildTarget) (reference.NamedTagged, error)
-	DeprecatedFastBuildImage(ctx context.Context, ps *PipelineState, ref reference.Named, baseDockerfile dockerfile.Dockerfile, syncs []model.Sync, filter model.PathMatcher, runs []model.Run, entrypoint model.Cmd) (reference.NamedTagged, error)
-	PushImage(ctx context.Context, name reference.NamedTagged, writer io.Writer) (reference.NamedTagged, error)
-	TagImage(ctx context.Context, name reference.Named, dig digest.Digest) (reference.NamedTagged, error)
+	BuildImage(ctx context.Context, ps *PipelineState, refs container.RefSet, db model.DockerBuild, filter model.PathMatcher) (container.TaggedRefs, error)
+	PushImage(ctx context.Context, name reference.NamedTagged) error
+	TagRefs(ctx context.Context, refs container.RefSet, dig digest.Digest) (container.TaggedRefs, error)
 	ImageExists(ctx context.Context, ref reference.NamedTagged) (bool, error)
 }
 
@@ -57,44 +57,17 @@ func NewDockerImageBuilder(dCli docker.Client, extraLabels dockerfile.Labels) *d
 	}
 }
 
-func (d *dockerImageBuilder) BuildImage(ctx context.Context, ps *PipelineState, ref reference.Named, df dockerfile.Dockerfile, buildPath string, filter model.PathMatcher,
-	buildArgs map[string]string, targetStage model.DockerBuildTarget) (reference.NamedTagged, error) {
+func (d *dockerImageBuilder) BuildImage(ctx context.Context, ps *PipelineState, refs container.RefSet, db model.DockerBuild, filter model.PathMatcher) (container.TaggedRefs, error) {
 	span, ctx := opentracing.StartSpanFromContext(ctx, "dib-BuildImage")
 	defer span.Finish()
 
 	paths := []PathMapping{
 		{
-			LocalPath:     buildPath,
+			LocalPath:     db.BuildPath,
 			ContainerPath: "/",
 		},
 	}
-	return d.buildFromDf(ctx, ps, df, paths, filter, ref, buildArgs, targetStage)
-}
-
-func (d *dockerImageBuilder) DeprecatedFastBuildImage(ctx context.Context, ps *PipelineState, ref reference.Named, baseDockerfile dockerfile.Dockerfile,
-	syncs []model.Sync, filter model.PathMatcher,
-	runs []model.Run, entrypoint model.Cmd) (reference.NamedTagged, error) {
-
-	span, ctx := opentracing.StartSpanFromContext(ctx, "daemon-DeprecatedFastBuildImage")
-	defer span.Finish()
-
-	hasEntrypoint := !entrypoint.Empty()
-
-	paths := SyncsToPathMappings(syncs)
-	df := baseDockerfile
-	df, runs, err := d.addConditionalRuns(df, runs, paths)
-	if err != nil {
-		return nil, errors.Wrapf(err, "DeprecatedFastBuildImage")
-	}
-
-	df = df.AddAll()
-	df = d.addRemainingRuns(df, runs)
-	if hasEntrypoint {
-		df = df.Entrypoint(entrypoint)
-	}
-
-	df = d.applyLabels(df, BuildModeScratch)
-	return d.buildFromDf(ctx, ps, df, paths, filter, ref, model.DockerBuildArgs{}, "")
+	return d.buildFromDf(ctx, ps, db, paths, filter, refs)
 }
 
 func (d *dockerImageBuilder) applyLabels(df dockerfile.Dockerfile, buildMode dockerfile.LabelValue) dockerfile.Dockerfile {
@@ -178,31 +151,32 @@ func (d *dockerImageBuilder) addRemainingRuns(df dockerfile.Dockerfile, remainin
 }
 
 // Tag the digest with the given name and wm-tilt tag.
-func (d *dockerImageBuilder) TagImage(ctx context.Context, ref reference.Named, dig digest.Digest) (reference.NamedTagged, error) {
+func (d *dockerImageBuilder) TagRefs(ctx context.Context, refs container.RefSet, dig digest.Digest) (container.TaggedRefs, error) {
 	tag, err := digestAsTag(dig)
 	if err != nil {
-		return nil, errors.Wrap(err, "TagImage")
+		return container.TaggedRefs{}, errors.Wrap(err, "TagImage")
 	}
 
-	namedTagged, err := reference.WithTag(ref, tag)
+	tagged, err := refs.TagRefs(tag)
 	if err != nil {
-		return nil, errors.Wrap(err, "TagImage")
+		return container.TaggedRefs{}, errors.Wrap(err, "TagImage")
 	}
 
-	err = d.dCli.ImageTag(ctx, dig.String(), namedTagged.String())
+	// Docker client only needs to care about the localImage
+	err = d.dCli.ImageTag(ctx, dig.String(), tagged.LocalRef.String())
 	if err != nil {
-		return nil, errors.Wrap(err, "TagImage#ImageTag")
+		return container.TaggedRefs{}, errors.Wrap(err, "TagImage#ImageTag")
 	}
 
-	return namedTagged, nil
+	return tagged, nil
 }
 
-// Naively tag the digest and push it up to the docker registry specified in the name.
+// Push the specified ref up to the docker registry specified in the name.
 //
 // TODO(nick) In the future, I would like us to be smarter about checking if the kubernetes cluster
 // we're running in has access to the given registry. And if it doesn't, we should either emit an
 // error, or push to a registry that kubernetes does have access to (e.g., a local registry).
-func (d *dockerImageBuilder) PushImage(ctx context.Context, ref reference.NamedTagged, writer io.Writer) (reference.NamedTagged, error) {
+func (d *dockerImageBuilder) PushImage(ctx context.Context, ref reference.NamedTagged) error {
 	l := logger.Get(ctx)
 
 	span, ctx := opentracing.StartSpanFromContext(ctx, "daemon-PushImage")
@@ -210,7 +184,7 @@ func (d *dockerImageBuilder) PushImage(ctx context.Context, ref reference.NamedT
 
 	imagePushResponse, err := d.dCli.ImagePush(ctx, ref)
 	if err != nil {
-		return nil, errors.Wrap(err, "PushImage#ImagePush")
+		return errors.Wrap(err, "PushImage#ImagePush")
 	}
 
 	defer func() {
@@ -220,12 +194,12 @@ func (d *dockerImageBuilder) PushImage(ctx context.Context, ref reference.NamedT
 		}
 	}()
 
-	_, err = readDockerOutput(ctx, imagePushResponse, writer)
+	_, err = readDockerOutput(ctx, imagePushResponse)
 	if err != nil {
-		return nil, errors.Wrapf(err, "pushing image %q", ref.Name())
+		return errors.Wrapf(err, "pushing image %q", ref.Name())
 	}
 
-	return ref, nil
+	return nil
 }
 
 func (d *dockerImageBuilder) ImageExists(ctx context.Context, ref reference.NamedTagged) (bool, error) {
@@ -236,40 +210,40 @@ func (d *dockerImageBuilder) ImageExists(ctx context.Context, ref reference.Name
 	return len(images) > 0, nil
 }
 
-func (d *dockerImageBuilder) buildFromDf(ctx context.Context, ps *PipelineState, df dockerfile.Dockerfile, paths []PathMapping, filter model.PathMatcher, ref reference.Named, buildArgs model.DockerBuildArgs, targetStage model.DockerBuildTarget) (reference.NamedTagged, error) {
-	logger.Get(ctx).Infof("Building Dockerfile:\n%s\n", indent(df.String(), "  "))
+func (d *dockerImageBuilder) buildFromDf(ctx context.Context, ps *PipelineState, db model.DockerBuild, paths []PathMapping, filter model.PathMatcher, refs container.RefSet) (container.TaggedRefs, error) {
+	logger.Get(ctx).Infof("Building Dockerfile:\n%s\n", indent(db.Dockerfile, "  "))
 	span, ctx := opentracing.StartSpanFromContext(ctx, "daemon-buildFromDf")
 	defer span.Finish()
 
 	ps.StartBuildStep(ctx, "Tarring context…")
 
 	// NOTE(maia): some people want to know what files we're adding (b/c `ADD . /` isn't descriptive)
-	if logger.Get(ctx).Level() >= logger.VerboseLvl {
+	if logger.Get(ctx).Level().ShouldDisplay(logger.VerboseLvl) {
 		for _, pm := range paths {
 			ps.Printf(ctx, pm.PrettyStr())
 		}
 	}
 
 	pr, pw := io.Pipe()
-	go func() {
-		err := tarContextAndUpdateDf(ctx, pw, df, paths, filter)
+	go func(ctx context.Context) {
+		err := tarContextAndUpdateDf(ctx, pw, dockerfile.Dockerfile(db.Dockerfile), paths, filter)
 		if err != nil {
 			_ = pw.CloseWithError(err)
 		} else {
 			_ = pw.Close()
 		}
-	}()
+	}(ctx)
 
 	ps.StartBuildStep(ctx, "Building image")
 	spanBuild, ctx := opentracing.StartSpanFromContext(ctx, "daemon-ImageBuild")
 	imageBuildResponse, err := d.dCli.ImageBuild(
 		ctx,
 		pr,
-		Options(pr, buildArgs, targetStage),
+		Options(pr, db),
 	)
 	spanBuild.Finish()
 	if err != nil {
-		return nil, err
+		return container.TaggedRefs{}, err
 	}
 
 	defer func() {
@@ -279,21 +253,21 @@ func (d *dockerImageBuilder) buildFromDf(ctx context.Context, ps *PipelineState,
 		}
 	}()
 
-	digest, err := d.getDigestFromBuildOutput(ctx, imageBuildResponse.Body, ps.Writer(ctx))
+	digest, err := d.getDigestFromBuildOutput(ps.AttachLogger(ctx), imageBuildResponse.Body)
 	if err != nil {
-		return nil, err
+		return container.TaggedRefs{}, err
 	}
 
-	nt, err := d.TagImage(ctx, ref, digest)
+	tagged, err := d.TagRefs(ctx, refs, digest)
 	if err != nil {
-		return nil, errors.Wrap(err, "PushImage")
+		return container.TaggedRefs{}, errors.Wrap(err, "PushImage")
 	}
 
-	return nt, nil
+	return tagged, nil
 }
 
-func (d *dockerImageBuilder) getDigestFromBuildOutput(ctx context.Context, reader io.Reader, writer io.Writer) (digest.Digest, error) {
-	result, err := readDockerOutput(ctx, reader, writer)
+func (d *dockerImageBuilder) getDigestFromBuildOutput(ctx context.Context, reader io.Reader) (digest.Digest, error) {
+	result, err := readDockerOutput(ctx, reader)
 	if err != nil {
 		return "", errors.Wrap(err, "ImageBuild")
 	}
@@ -306,6 +280,31 @@ func (d *dockerImageBuilder) getDigestFromBuildOutput(ctx context.Context, reade
 	return digest, nil
 }
 
+var dockerBuildCleanupRexes = []*regexp.Regexp{
+	// the "runc did not determinate sucessfully" just seems redundant on top of "executor failed running"
+	// nolint
+	regexp.MustCompile("(executor failed running.*): runc did not terminate sucessfully"), // sucessfully (sic)
+	// when a file is missing, it generates an error like "failed to compute cache key: foo.txt not found: not found"
+	// most of that seems redundant and/or confusing
+	regexp.MustCompile("failed to compute cache key: (.* not found): not found"),
+}
+
+// buildkit emits errors that might be useful for people who are into buildkit internals, but aren't really
+// at the optimal level for people who just wanna build something
+// ideally we'll get buildkit to emit errors with more structure so that we don't have to rely on string manipulation,
+// but to have impact via that route, we've got to get the change in and users have to upgrade to a version of docker
+// that has that change. So let's clean errors up here until that's in a good place.
+func cleanupDockerBuildError(err string) string {
+	// this is pretty much always the same, and meaningless noise to most users
+	ret := strings.TrimPrefix(err, "failed to solve with frontend dockerfile.v0: failed to build LLB: ")
+	for _, re := range dockerBuildCleanupRexes {
+		ret = re.ReplaceAllString(ret, "$1")
+	}
+	return ret
+}
+
+type dockerMessageID string
+
 // Docker API commands stream back a sequence of JSON messages.
 //
 // The result of the command is in a JSON object with field "aux".
@@ -315,15 +314,17 @@ func (d *dockerImageBuilder) getDigestFromBuildOutput(ctx context.Context, reade
 // NOTE(nick): I haven't found a good document describing this protocol
 // but you can find it implemented in Docker here:
 // https://github.com/moby/moby/blob/1da7d2eebf0a7a60ce585f89a05cebf7f631019c/pkg/jsonmessage/jsonmessage.go#L139
-func readDockerOutput(ctx context.Context, reader io.Reader, writer io.Writer) (dockerOutput, error) {
+func readDockerOutput(ctx context.Context, reader io.Reader) (dockerOutput, error) {
 	span, ctx := opentracing.StartSpanFromContext(ctx, "daemon-readDockerOutput")
 	defer span.Finish()
+
+	progressLastPrinted := make(map[dockerMessageID]time.Time)
 
 	result := dockerOutput{}
 	decoder := json.NewDecoder(reader)
 	var innerSpan opentracing.Span
 
-	b := newBuildkitPrinter(logger.Get(ctx).Writer(logger.InfoLvl))
+	b := newBuildkitPrinter(logger.Get(ctx))
 
 	for decoder.More() {
 		if innerSpan != nil {
@@ -344,21 +345,38 @@ func readDockerOutput(ctx context.Context, reader io.Reader, writer io.Writer) (
 				result.shortDigest = builtDigestMatch[1]
 			}
 
-			_, err = writer.Write([]byte(msg))
-			if err != nil {
-				return dockerOutput{}, errors.Wrap(err, "failed to write docker output")
-			}
+			logger.Get(ctx).Write(logger.InfoLvl, []byte(msg))
 			if strings.HasPrefix(msg, "Run") || strings.HasPrefix(msg, "Running") {
 				innerSpan, ctx = opentracing.StartSpanFromContext(ctx, msg)
 			}
 		}
 
 		if message.ErrorMessage != "" {
-			return dockerOutput{}, errors.New(message.ErrorMessage)
+			return dockerOutput{}, errors.New(cleanupDockerBuildError(message.ErrorMessage))
 		}
 
 		if message.Error != nil {
-			return dockerOutput{}, errors.New(message.Error.Message)
+			return dockerOutput{}, errors.New(cleanupDockerBuildError(message.Error.Message))
+		}
+
+		id := dockerMessageID(message.ID)
+		if id != "" && message.Progress != nil {
+			// Add a small 2-second backoff so that we don't overwhelm the logstore.
+			lastPrinted, hasBeenPrinted := progressLastPrinted[id]
+			shouldPrint := !hasBeenPrinted ||
+				message.Progress.Current == message.Progress.Total ||
+				time.Since(lastPrinted) > 2*time.Second
+			shouldSkip := message.Progress.Current == 0 &&
+				(message.Status == "Waiting" || message.Status == "Preparing")
+			if shouldPrint && !shouldSkip {
+				fields := logger.Fields{logger.FieldNameProgressID: message.ID}
+				if message.Progress.Current == message.Progress.Total {
+					fields[logger.FieldNameProgressMustPrint] = "1"
+				}
+				logger.Get(ctx).WithFields(fields).
+					Infof("%s: %s %s", id, message.Status, message.Progress.String())
+				progressLastPrinted[id] = time.Now()
+			}
 		}
 
 		if messageIsFromBuildkit(message) {
@@ -395,9 +413,10 @@ func toBuildkitStatus(aux *json.RawMessage, b *buildkitPrinter) error {
 	return b.parseAndPrint(toVertexes(resp))
 }
 
-func toVertexes(resp controlapi.StatusResponse) ([]*vertex, []*vertexLog) {
+func toVertexes(resp controlapi.StatusResponse) ([]*vertex, []*vertexLog, []*vertexStatus) {
 	vertexes := []*vertex{}
 	logs := []*vertexLog{}
+	statuses := []*vertexStatus{}
 
 	for _, v := range resp.Vertexes {
 		duration := time.Duration(0)
@@ -423,7 +442,16 @@ func toVertexes(resp controlapi.StatusResponse) ([]*vertex, []*vertexLog) {
 			msg:    v.Msg,
 		})
 	}
-	return vertexes, logs
+	for _, s := range resp.Statuses {
+		statuses = append(statuses, &vertexStatus{
+			vertex:    s.Vertex,
+			id:        s.ID,
+			total:     s.Total,
+			current:   s.Current,
+			timestamp: s.Timestamp,
+		})
+	}
+	return vertexes, logs, statuses
 }
 
 func messageIsFromBuildkit(msg jsonmessage.JSONMessage) bool {

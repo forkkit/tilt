@@ -18,18 +18,16 @@ type ServiceWatcher struct {
 	kCli         k8s.Client
 	ownerFetcher k8s.OwnerFetcher
 	watching     bool
-	nodeIP       k8s.NodeIP
 
 	mu                sync.RWMutex
 	knownDeployedUIDs map[types.UID]model.ManifestName
 	knownServices     map[types.UID]*v1.Service
 }
 
-func NewServiceWatcher(kCli k8s.Client, ownerFetcher k8s.OwnerFetcher, nodeIP k8s.NodeIP) *ServiceWatcher {
+func NewServiceWatcher(kCli k8s.Client, ownerFetcher k8s.OwnerFetcher) *ServiceWatcher {
 	return &ServiceWatcher{
 		kCli:              kCli,
 		ownerFetcher:      ownerFetcher,
-		nodeIP:            nodeIP,
 		knownDeployedUIDs: make(map[types.UID]model.ManifestName),
 		knownServices:     make(map[types.UID]*v1.Service),
 	}
@@ -89,33 +87,11 @@ func (w *ServiceWatcher) setupNewUIDs(ctx context.Context, st store.RStore, newU
 			continue
 		}
 
-		err := DispatchServiceChange(st, service, mn, w.nodeIP)
+		err := DispatchServiceChange(st, service, mn, w.kCli.NodeIP(ctx))
 		if err != nil {
 			logger.Get(ctx).Infof("error resolving service url %s: %v", service.Name, err)
 		}
 	}
-}
-
-// Record the service update, and return true if this is newer than
-// the state we already know about.
-func (w *ServiceWatcher) recordServiceUpdate(service *v1.Service) bool {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	uid := service.UID
-	oldService, ok := w.knownServices[uid]
-
-	// In "real" code, if we get two service updates with the same resource version,
-	// we can safely ignore the new one. But dispatching a spurious event
-	// in this case makes testing much easier, because the test harness doesn't need
-	// to keep track of ResourceVersions
-	olderThanKnown := ok && oldService.ResourceVersion > service.ResourceVersion
-	if olderThanKnown {
-		return false
-	}
-
-	w.knownServices[uid] = service
-	return true
 }
 
 // Match up the service update to a manifest.
@@ -127,6 +103,8 @@ func (w *ServiceWatcher) triageServiceUpdate(service *v1.Service) model.Manifest
 	defer w.mu.Unlock()
 
 	uid := service.UID
+	w.knownServices[uid] = service
+
 	manifestName, ok := w.knownDeployedUIDs[uid]
 	if !ok {
 		return ""
@@ -143,17 +121,12 @@ func (w *ServiceWatcher) dispatchServiceChangesLoop(ctx context.Context, ch <-ch
 				return
 			}
 
-			ok = w.recordServiceUpdate(service)
-			if !ok {
-				continue
-			}
-
 			manifestName := w.triageServiceUpdate(service)
 			if manifestName == "" {
 				continue
 			}
 
-			err := DispatchServiceChange(st, service, manifestName, w.nodeIP)
+			err := DispatchServiceChange(st, service, manifestName, w.kCli.NodeIP(ctx))
 			if err != nil {
 				logger.Get(ctx).Infof("error resolving service url %s: %v", service.Name, err)
 			}

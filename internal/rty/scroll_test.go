@@ -90,11 +90,13 @@ func TestTextScroll(t *testing.T) {
 }
 
 type elementScrollTestFixture struct {
+	t *testing.T
 	i InteractiveTester
 }
 
 func newElementScrollTestFixture(t *testing.T) *elementScrollTestFixture {
 	return &elementScrollTestFixture{
+		t: t,
 		i: NewInteractiveTester(t, screen),
 	}
 }
@@ -135,16 +137,16 @@ func (f *elementScrollTestFixture) run(name string) {
 }
 
 func (f *elementScrollTestFixture) down() {
-	f.i.render(20, 10, f.layout())
+	_ = f.i.render(20, 10, f.layout())
 	f.scroller().Down()
 }
 
 func (f *elementScrollTestFixture) up() {
-	f.i.render(20, 10, f.layout())
+	_ = f.i.render(20, 10, f.layout())
 	f.scroller().Up()
 }
 
 func (f *elementScrollTestFixture) bottom() {
-	f.i.render(20, 10, f.layout())
+	_ = f.i.render(20, 10, f.layout())
 	f.scroller().Bottom()
 }

@@ -5,16 +5,21 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/windmilleng/wmclient/pkg/analytics"
 
+	"github.com/windmilleng/tilt/internal/k8s"
+
+	tiltanalytics "github.com/windmilleng/tilt/internal/analytics"
 	"github.com/windmilleng/tilt/internal/container"
 	"github.com/windmilleng/tilt/internal/dockercompose"
 	"github.com/windmilleng/tilt/internal/hud/view"
 	"github.com/windmilleng/tilt/internal/ospath"
 	"github.com/windmilleng/tilt/internal/token"
 	"github.com/windmilleng/tilt/pkg/model"
+	"github.com/windmilleng/tilt/pkg/model/logstore"
 )
 
 type EngineState struct {
@@ -27,50 +32,48 @@ type EngineState struct {
 	// TODO(nick): This will eventually be a general Target index.
 	ManifestTargets map[model.ManifestName]*ManifestTarget
 
-	CurrentlyBuilding model.ManifestName
+	CurrentlyBuilding map[model.ManifestName]bool
 	WatchFiles        bool
 
-	// How many builds were queued on startup (i.e., how many manifests there were
-	// after initial Tiltfile load)
-	InitialBuildsQueued int
+	// For synchronizing BuildController -- wait until engine records all builds started
+	// so far before starting another build
+	StartedBuildCount int
 
 	// How many builds have been completed (pass or fail) since starting tilt
 	CompletedBuildCount int
 
-	// For synchronizing BuildController so that it's only
-	// doing one action at a time. In the future, we might
-	// want to allow it to parallelize builds better, but that
-	// would require better tools for triaging output to different streams.
-	BuildControllerActionCount int
+	MaxParallelUpdates int
 
 	FatalError error
+	HUDEnabled bool
 
 	// The user has indicated they want to exit
 	UserExited bool
 
-	// The full log stream for tilt. This might deserve gc or file storage at some point.
-	Log model.Log `testdiff:"ignore"`
+	// We recovered from a panic(). We need to clean up the RTY and print the error.
+	PanicExited error
+
+	// All logs in Tilt, stored in a structured format.
+	LogStore *logstore.LogStore `testdiff:"ignore"`
 
 	TiltfilePath             string
 	ConfigFiles              []string
 	TiltIgnoreContents       string
 	PendingConfigFileChanges map[string]time.Time
 
-	// InitManifests is the list of manifest names that we were told to init from the CLI.
-	InitManifests []model.ManifestName
-
 	TriggerQueue []model.ManifestName
 
-	LogTimestamps bool
-	IsProfiling   bool
+	IsProfiling bool
 
 	TiltfileState ManifestState
 
-	// from GitHub
-	LatestTiltBuild model.TiltBuild
+	LatestTiltBuild model.TiltBuild // from GitHub
+	VersionSettings model.VersionSettings
 
 	// Analytics Info
-	AnalyticsOpt           analytics.Opt // changes to this field will propagate into the TiltAnalytics subscriber + we'll record them as user choice
+	AnalyticsEnvOpt        analytics.Opt
+	AnalyticsUserOpt       analytics.Opt // changes to this field will propagate into the TiltAnalytics subscriber + we'll record them as user choice
+	AnalyticsTiltfileOpt   analytics.Opt // Set by the Tiltfile. Overrides the UserOpt.
 	AnalyticsNudgeSurfaced bool          // this flag is set the first time we show the analytics nudge to the user.
 
 	Features map[string]bool
@@ -84,6 +87,24 @@ type EngineState struct {
 	TiltCloudUsername                           string
 	TokenKnownUnregistered                      bool // to distinguish whether an empty TiltCloudUsername means "we haven't checked" or "we checked and the token isn't registered"
 	WaitingForTiltCloudUsernamePostRegistration bool
+
+	DockerPruneSettings model.DockerPruneSettings
+
+	TelemetrySettings model.TelemetrySettings
+
+	UserConfigState model.UserConfigState
+}
+
+// Merge analytics opt-in status from different sources.
+// The Tiltfile opt-in takes precedence over the user opt-in.
+func (e *EngineState) AnalyticsEffectiveOpt() analytics.Opt {
+	if e.AnalyticsEnvOpt != analytics.OptDefault {
+		return e.AnalyticsEnvOpt
+	}
+	if e.AnalyticsTiltfileOpt != analytics.OptDefault {
+		return e.AnalyticsTiltfileOpt
+	}
+	return e.AnalyticsUserOpt
 }
 
 func (e *EngineState) ManifestNamesForTargetID(id model.TargetID) []model.ManifestName {
@@ -108,6 +129,10 @@ func (e *EngineState) ManifestNamesForTargetID(id model.TargetID) []model.Manife
 	return result
 }
 
+func (e *EngineState) IsCurrentlyBuilding(name model.ManifestName) bool {
+	return e.CurrentlyBuilding[name]
+}
+
 func (e *EngineState) BuildStatus(id model.TargetID) BuildStatus {
 	mns := e.ManifestNamesForTargetID(id)
 	for _, mn := range mns {
@@ -118,6 +143,16 @@ func (e *EngineState) BuildStatus(id model.TargetID) BuildStatus {
 		}
 	}
 	return BuildStatus{}
+}
+
+func (e *EngineState) AvailableBuildSlots() int {
+	currentlyBuilding := len(e.CurrentlyBuilding)
+	if currentlyBuilding >= e.MaxParallelUpdates {
+		// this could happen if user decreases max build slots while
+		// multiple builds are in progress, no big deal
+		return 0
+	}
+	return e.MaxParallelUpdates - currentlyBuilding
 }
 
 func (e *EngineState) UpsertManifestTarget(mt *ManifestTarget) {
@@ -184,6 +219,15 @@ func (e EngineState) Targets() []*ManifestTarget {
 	return result
 }
 
+func (e *EngineState) ManifestInTriggerQueue(mn model.ManifestName) bool {
+	for _, queued := range e.TriggerQueue {
+		if queued == mn {
+			return true
+		}
+	}
+	return false
+}
+
 func (e EngineState) RelativeTiltfilePath() (string, error) {
 	wd, err := os.Getwd()
 	if err != nil {
@@ -200,6 +244,36 @@ func (e EngineState) LastTiltfileError() error {
 	return e.TiltfileState.LastBuild().Error
 }
 
+func (e *EngineState) HasDockerBuild() bool {
+	for _, m := range e.Manifests() {
+		for _, targ := range m.ImageTargets {
+			if targ.IsDockerBuild() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (e *EngineState) InitialBuildsCompleted() bool {
+	if e.ManifestTargets == nil || len(e.ManifestTargets) == 0 {
+		return false
+	}
+
+	for _, mt := range e.ManifestTargets {
+		if !mt.Manifest.TriggerMode.AutoInitial() {
+			continue
+		}
+
+		ms, _ := e.ManifestState(mt.Manifest.Name)
+		if ms == nil || ms.LastBuild().Empty() {
+			return false
+		}
+	}
+
+	return true
+}
+
 // TODO(nick): This will eventually implement TargetStatus
 type BuildStatus struct {
 	// Stores the times of all the pending changes,
@@ -208,6 +282,7 @@ type BuildStatus struct {
 	PendingFileChanges map[string]time.Time
 
 	LastSuccessfulResult BuildResult
+	LastResult           BuildResult
 }
 
 func newBuildStatus() *BuildStatus {
@@ -217,13 +292,11 @@ func newBuildStatus() *BuildStatus {
 }
 
 func (s BuildStatus) IsEmpty() bool {
-	return len(s.PendingFileChanges) == 0 && s.LastSuccessfulResult.IsEmpty()
+	return len(s.PendingFileChanges) == 0 && s.LastSuccessfulResult == nil
 }
 
 type ManifestState struct {
 	Name model.ManifestName
-
-	DeployID model.DeployID // ID we have assigned to the current deploy (helps find expected k8s objects)
 
 	BuildStatuses map[model.TargetID]*BuildStatus
 	RuntimeState  RuntimeState
@@ -250,19 +323,30 @@ type ManifestState struct {
 	// around for a little while so we can show it in the UX.
 	CrashLog model.Log
 
-	// The log stream for this resource
-	CombinedLog model.Log `testdiff:"ignore"`
-
 	// If this manifest was changed, which config files led to the most recent change in manifest definition
 	ConfigFilesThatCausedChange []string
+
+	// If the build was manually triggered, record why.
+	TriggerReason model.BuildReason
 }
 
 func NewState() *EngineState {
 	ret := &EngineState{}
-	ret.Log = model.Log{}
+	ret.LogStore = logstore.NewLogStore()
 	ret.ManifestTargets = make(map[model.ManifestName]*ManifestTarget)
 	ret.PendingConfigFileChanges = make(map[string]time.Time)
 	ret.Secrets = model.SecretSet{}
+	ret.DockerPruneSettings = model.DefaultDockerPruneSettings()
+	ret.VersionSettings = model.VersionSettings{
+		CheckUpdates: true,
+	}
+	ret.MaxParallelUpdates = 1
+	ret.CurrentlyBuilding = make(map[model.ManifestName]bool)
+
+	if ok, _ := tiltanalytics.IsAnalyticsDisabledFromEnv(); ok {
+		ret.AnalyticsEnvOpt = analytics.OptOut
+	}
+
 	return ret
 }
 
@@ -327,8 +411,26 @@ func (ms *ManifestState) IsK8s() bool {
 	return ok
 }
 
+func (ms *ManifestState) LocalRuntimeState() LocalRuntimeState {
+	ret, _ := ms.RuntimeState.(LocalRuntimeState)
+	return ret
+}
+
+func (ms *ManifestState) GetOrCreateLocalRuntimeState() LocalRuntimeState {
+	ret, ok := ms.RuntimeState.(LocalRuntimeState)
+	if !ok {
+		ret = LocalRuntimeState{}
+		ms.RuntimeState = ret
+	}
+	return ret
+}
+
 func (ms *ManifestState) ActiveBuild() model.BuildRecord {
 	return ms.CurrentBuild
+}
+
+func (ms *ManifestState) IsBuilding() bool {
+	return !ms.CurrentBuild.Empty()
 }
 
 func (ms *ManifestState) LastBuild() model.BuildRecord {
@@ -353,6 +455,15 @@ func (ms *ManifestState) MostRecentPod() Pod {
 	return ms.K8sRuntimeState().MostRecentPod()
 }
 
+func (ms *ManifestState) PodWithID(pid k8s.PodID) (*Pod, bool) {
+	for id, pod := range ms.K8sRuntimeState().Pods {
+		if id == pid {
+			return pod, true
+		}
+	}
+	return nil, false
+}
+
 func (ms *ManifestState) HasPendingFileChanges() bool {
 	for _, status := range ms.BuildStatuses {
 		if len(status.PendingFileChanges) > 0 {
@@ -362,18 +473,19 @@ func (ms *ManifestState) HasPendingFileChanges() bool {
 	return false
 }
 
-func (ms *ManifestState) NextBuildReason() model.BuildReason {
-	reason := model.BuildReasonNone
-	if ms.HasPendingFileChanges() {
+func (mt *ManifestTarget) NextBuildReason() model.BuildReason {
+	state := mt.State
+	reason := state.TriggerReason
+	if mt.State.HasPendingFileChanges() {
 		reason = reason.With(model.BuildReasonFlagChangedFiles)
 	}
-	if !ms.PendingManifestChange.IsZero() {
+	if !mt.State.PendingManifestChange.IsZero() {
 		reason = reason.With(model.BuildReasonFlagConfig)
 	}
-	if !ms.StartedFirstBuild() {
+	if !mt.State.StartedFirstBuild() && mt.Manifest.TriggerMode.AutoInitial() {
 		reason = reason.With(model.BuildReasonFlagInit)
 	}
-	if ms.NeedsRebuildFromCrash {
+	if mt.State.NeedsRebuildFromCrash {
 		reason = reason.With(model.BuildReasonFlagCrash)
 	}
 	return reason
@@ -469,7 +581,11 @@ func ManifestTargetEndpoints(mt *ManifestTarget) (endpoints []string) {
 	portForwards := mt.Manifest.K8sTarget().PortForwards
 	if len(portForwards) > 0 {
 		for _, pf := range portForwards {
-			endpoints = append(endpoints, fmt.Sprintf("http://localhost:%d/", pf.LocalPort))
+			host := pf.Host
+			if host == "" {
+				host = "localhost"
+			}
+			endpoints = append(endpoints, fmt.Sprintf("http://%s:%d/", host, pf.LocalPort))
 		}
 		return endpoints
 	}
@@ -490,10 +606,9 @@ func ManifestTargetEndpoints(mt *ManifestTarget) (endpoints []string) {
 	return endpoints
 }
 
-func StateToView(s EngineState) view.View {
+func StateToView(s EngineState, mu *sync.RWMutex) view.View {
 	ret := view.View{
-		IsProfiling:   s.IsProfiling,
-		LogTimestamps: s.LogTimestamps,
+		IsProfiling: s.IsProfiling,
 	}
 
 	ret.Resources = append(ret.Resources, tiltfileResourceView(s))
@@ -557,7 +672,7 @@ func StateToView(s EngineState) view.View {
 			BuildHistory:       buildHistory,
 			PendingBuildEdits:  pendingBuildEdits,
 			PendingBuildSince:  pendingBuildSince,
-			PendingBuildReason: ms.NextBuildReason(),
+			PendingBuildReason: mt.NextBuildReason(),
 			CurrentBuild:       currentBuild,
 			CrashLog:           ms.CrashLog,
 			Endpoints:          endpoints,
@@ -567,24 +682,20 @@ func StateToView(s EngineState) view.View {
 		ret.Resources = append(ret.Resources, r)
 	}
 
-	ret.Log = s.Log
+	ret.LogReader = logstore.NewReader(mu, s.LogStore)
 	ret.FatalError = s.FatalError
 
 	return ret
 }
 
+const TiltfileManifestName = model.TiltfileManifestName
+
 func tiltfileResourceView(s EngineState) view.Resource {
-	ltfb := s.TiltfileState.LastBuild()
-	if !s.TiltfileState.CurrentBuild.Empty() {
-		ltfb.Log = s.TiltfileState.CurrentBuild.Log
-	}
 	tr := view.Resource{
-		Name:         view.TiltfileResourceName,
+		Name:         TiltfileManifestName,
 		IsTiltfile:   true,
 		CurrentBuild: s.TiltfileState.CurrentBuild,
-		BuildHistory: []model.BuildRecord{
-			ltfb,
-		},
+		BuildHistory: s.TiltfileState.BuildHistory,
 	}
 	if !s.TiltfileState.CurrentBuild.Empty() {
 		tr.PendingBuildSince = s.TiltfileState.CurrentBuild.StartTime
@@ -610,7 +721,7 @@ func resourceInfoView(mt *ManifestTarget) view.ResourceInfoView {
 	switch state := mt.State.RuntimeState.(type) {
 	case dockercompose.State:
 		return view.NewDCResourceInfo(mt.Manifest.DockerComposeTarget().ConfigPaths,
-			state.Status, state.ContainerID, state.Log(), state.StartTime)
+			state.Status, state.ContainerID, state.SpanID, state.StartTime)
 	case K8sRuntimeState:
 		pod := state.MostRecentPod()
 		return view.K8sResourceInfo{
@@ -619,10 +730,10 @@ func resourceInfoView(mt *ManifestTarget) view.ResourceInfoView {
 			PodUpdateStartTime: pod.UpdateStartTime,
 			PodStatus:          pod.Status,
 			PodRestarts:        pod.VisibleContainerRestarts(),
-			PodLog:             pod.CurrentLog,
+			SpanID:             pod.SpanID,
 		}
 	case LocalRuntimeState:
-		return view.LocalResourceInfo{}
+		return view.NewLocalResourceInfo(state.Status, state.PID, state.SpanID)
 	default:
 		// This is silly but it was the old behavior.
 		return view.K8sResourceInfo{}

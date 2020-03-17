@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
+	"github.com/windmilleng/tilt/internal/engine/runtimelog"
 	"github.com/windmilleng/tilt/internal/k8s"
 	"github.com/windmilleng/tilt/internal/store"
 	"github.com/windmilleng/tilt/pkg/logger"
@@ -103,13 +104,11 @@ func (m *PortForwardController) OnChange(ctx context.Context, st store.RStore) {
 
 	for _, entry := range toStart {
 		// Treat port-forwarding errors as part of the pod log
-		actionWriter := PodLogActionWriter{
-			store:        st,
-			podID:        entry.podID,
-			manifestName: entry.name,
-		}
-		ctx := entry.ctx
-		ctx = logger.WithLogger(ctx, logger.NewLogger(logger.Get(ctx).Level(), actionWriter))
+		ctx := logger.CtxWithLogHandler(entry.ctx, runtimelog.PodLogActionWriter{
+			Store:        st,
+			PodID:        entry.podID,
+			ManifestName: entry.name,
+		})
 
 		for _, forward := range entry.forwards {
 			entry := entry
@@ -157,7 +156,7 @@ func (m *PortForwardController) onePortForward(ctx context.Context, entry portFo
 	ns := entry.namespace
 	podID := entry.podID
 
-	pf, err := m.kClient.CreatePortForwarder(ctx, ns, podID, forward.LocalPort, forward.ContainerPort)
+	pf, err := m.kClient.CreatePortForwarder(ctx, ns, podID, forward.LocalPort, forward.ContainerPort, forward.Host)
 	if err != nil {
 		return err
 	}

@@ -53,11 +53,11 @@ func (ec *explodingClient) ContainerLogs(ctx context.Context, podID PodID, cName
 	return nil, errors.Wrap(ec.err, "could not set up k8s client")
 }
 
-func (ec *explodingClient) CreatePortForwarder(ctx context.Context, namespace Namespace, podID PodID, optionalLocalPort, remotePort int) (PortForwarder, error) {
+func (ec *explodingClient) CreatePortForwarder(ctx context.Context, namespace Namespace, podID PodID, optionalLocalPort, remotePort int, host string) (PortForwarder, error) {
 	return nil, errors.Wrap(ec.err, "could not set up k8s client")
 }
 
-func (ec *explodingClient) WatchPods(ctx context.Context, lps labels.Selector) (<-chan *v1.Pod, error) {
+func (ec *explodingClient) WatchPods(ctx context.Context, lps labels.Selector) (<-chan ObjectUpdate, error) {
 	return nil, errors.Wrap(ec.err, "could not set up k8s client")
 }
 
@@ -77,7 +77,11 @@ func (ec *explodingClient) ContainerRuntime(ctx context.Context) container.Runti
 	return container.RuntimeUnknown
 }
 
-func (ec *explodingClient) PrivateRegistry(ctx context.Context) container.Registry {
+func (ec *explodingClient) LocalRegistry(ctx context.Context) container.Registry {
+	return container.Registry{}
+}
+
+func (ec *explodingClient) NodeIP(ctx context.Context) NodeIP {
 	return ""
 }
 

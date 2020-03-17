@@ -1,0 +1,600 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "pkg/webview/view.proto",
+    "version": "version not set"
+  },
+  "schemes": [
+    "http",
+    "https"
+  ],
+  "consumes": [
+    "application/json"
+  ],
+  "produces": [
+    "application/json"
+  ],
+  "paths": {
+    "/api/snapshot/new": {
+      "post": {
+        "operationId": "UploadSnapshot",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/webviewUploadSnapshotResponse"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/webviewSnapshot"
+            }
+          }
+        ],
+        "tags": [
+          "ViewService"
+        ]
+      }
+    },
+    "/api/view": {
+      "get": {
+        "operationId": "GetView",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/webviewView"
+            }
+          }
+        },
+        "tags": [
+          "ViewService"
+        ]
+      }
+    },
+    "/websocket/ack": {
+      "post": {
+        "operationId": "AckWebsocket",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/webviewAckWebsocketResponse"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/webviewAckWebsocketRequest"
+            }
+          }
+        ],
+        "tags": [
+          "WebsocketService"
+        ]
+      }
+    }
+  },
+  "definitions": {
+    "webviewAckWebsocketRequest": {
+      "type": "object",
+      "properties": {
+        "to_checkpoint": {
+          "type": "integer",
+          "format": "int32",
+          "title": "The to_checkpoint on the received LogList"
+        },
+        "tilt_start_time": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Allows us to synchronize on a running Tilt intance,\nso we can tell when we're talking to the same Tilt."
+        }
+      },
+      "description": "The webclient needs to notify the server what logs it has,\nso the server knows what to send.\n\nThe socket protocol doesn't have any concept of a StatusCode\nto confirm that the receiver got the message, so we need to send this\nin a separate message."
+    },
+    "webviewAckWebsocketResponse": {
+      "type": "object"
+    },
+    "webviewBuildRecord": {
+      "type": "object",
+      "properties": {
+        "edits": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "error": {
+          "type": "string"
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "start_time": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "finish_time": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "update_types": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/webviewUpdateType"
+          }
+        },
+        "is_crash_rebuild": {
+          "type": "boolean",
+          "format": "boolean"
+        },
+        "span_id": {
+          "type": "string",
+          "description": "The span id for this build record's logs in the main logstore."
+        }
+      }
+    },
+    "webviewDCResourceInfo": {
+      "type": "object",
+      "properties": {
+        "config_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "container_status": {
+          "type": "string"
+        },
+        "containerID": {
+          "type": "string"
+        },
+        "start_time": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "span_id": {
+          "type": "string",
+          "title": "The span id for this docker-compose service's logs in the main logstore"
+        }
+      }
+    },
+    "webviewFacet": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        },
+        "span_id": {
+          "type": "string",
+          "description": "If span_id is non-empty, that means the value is in the logstore\ninstead of in the value field."
+        }
+      }
+    },
+    "webviewK8sResourceInfo": {
+      "type": "object",
+      "properties": {
+        "pod_name": {
+          "type": "string"
+        },
+        "pod_creation_time": {
+          "type": "string"
+        },
+        "pod_update_start_time": {
+          "type": "string"
+        },
+        "pod_status": {
+          "type": "string"
+        },
+        "pod_status_message": {
+          "type": "string"
+        },
+        "all_containers_ready": {
+          "type": "boolean",
+          "format": "boolean"
+        },
+        "pod_restarts": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "span_id": {
+          "type": "string",
+          "title": "The span id for this pod's logs in the main logstore"
+        }
+      }
+    },
+    "webviewLocalResourceInfo": {
+      "type": "object",
+      "properties": {
+        "pid": {
+          "type": "string",
+          "format": "int64"
+        }
+      }
+    },
+    "webviewLogLevel": {
+      "type": "string",
+      "enum": [
+        "NONE",
+        "INFO",
+        "VERBOSE",
+        "DEBUG",
+        "WARN",
+        "ERROR"
+      ],
+      "default": "NONE",
+      "description": " - NONE: For backwards-compatibility, the int value doesn't say\nanything about relative severity."
+    },
+    "webviewLogList": {
+      "type": "object",
+      "properties": {
+        "spans": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/webviewLogSpan"
+          }
+        },
+        "segments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/webviewLogSegment"
+          }
+        },
+        "from_checkpoint": {
+          "type": "integer",
+          "format": "int32",
+          "description": "[from_checkpoint, to_checkpoint)\n\nAn interval of [0, 0) means that the server isn't using\nthe incremental load protocol.\n\nAn interval of [-1, -1) means that the server doesn't have new logs\nto send down.",
+          "title": "from_checkpoint and to_checkpoint express an interval on the\ncentral log-store, with an inclusive start and an exclusive end"
+        },
+        "to_checkpoint": {
+          "type": "integer",
+          "format": "int32"
+        }
+      }
+    },
+    "webviewLogSegment": {
+      "type": "object",
+      "properties": {
+        "span_id": {
+          "type": "string"
+        },
+        "time": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "text": {
+          "type": "string"
+        },
+        "level": {
+          "$ref": "#/definitions/webviewLogLevel"
+        },
+        "anchor": {
+          "type": "boolean",
+          "format": "boolean",
+          "description": "When we store warnings in the LogStore, we break them up into lines and\nstore them as a series of line segments. 'anchor' marks the beginning of a\nseries of logs that should be kept together.\n\nAnchor warning1, line1\n       warning1, line2\nAnchor warning2, line1"
+        },
+        "fields": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Context-specific optional fields for a log segment.\nUsed for experimenting with new types of log metadata."
+        }
+      }
+    },
+    "webviewLogSpan": {
+      "type": "object",
+      "properties": {
+        "manifest_name": {
+          "type": "string"
+        }
+      }
+    },
+    "webviewResource": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "directories_watched": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "paths_watched": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "last_deploy_time": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "trigger_mode": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "build_history": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/webviewBuildRecord"
+          }
+        },
+        "current_build": {
+          "$ref": "#/definitions/webviewBuildRecord"
+        },
+        "pending_build_reason": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "pending_build_edits": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "pending_build_since": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "has_pending_changes": {
+          "type": "boolean",
+          "format": "boolean"
+        },
+        "endpoints": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "podID": {
+          "type": "string"
+        },
+        "k8s_resource_info": {
+          "$ref": "#/definitions/webviewK8sResourceInfo"
+        },
+        "dc_resource_info": {
+          "$ref": "#/definitions/webviewDCResourceInfo"
+        },
+        "yaml_resource_info": {
+          "$ref": "#/definitions/webviewYAMLResourceInfo"
+        },
+        "local_resource_info": {
+          "$ref": "#/definitions/webviewLocalResourceInfo"
+        },
+        "runtime_status": {
+          "type": "string"
+        },
+        "is_tiltfile": {
+          "type": "boolean",
+          "format": "boolean"
+        },
+        "specs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/webviewTargetSpec"
+          }
+        },
+        "show_build_status": {
+          "type": "boolean",
+          "format": "boolean"
+        },
+        "crash_log": {
+          "type": "string",
+          "description": "Obsoleted by crash_log_span_id."
+        },
+        "crash_log_span_id": {
+          "type": "string",
+          "description": "A span id for the log that crashed."
+        },
+        "facets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/webviewFacet"
+          }
+        },
+        "queued": {
+          "type": "boolean",
+          "format": "boolean"
+        }
+      }
+    },
+    "webviewSnapshot": {
+      "type": "object",
+      "properties": {
+        "view": {
+          "$ref": "#/definitions/webviewView"
+        },
+        "is_sidebar_closed": {
+          "type": "boolean",
+          "format": "boolean"
+        },
+        "path": {
+          "type": "string"
+        },
+        "snapshot_highlight": {
+          "$ref": "#/definitions/webviewSnapshotHighlight"
+        },
+        "snapshot_link": {
+          "type": "string"
+        }
+      }
+    },
+    "webviewSnapshotHighlight": {
+      "type": "object",
+      "properties": {
+        "beginning_logID": {
+          "type": "string"
+        },
+        "ending_logID": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      }
+    },
+    "webviewTargetSpec": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/definitions/webviewTargetType"
+        },
+        "has_live_update": {
+          "type": "boolean",
+          "format": "boolean"
+        }
+      }
+    },
+    "webviewTargetType": {
+      "type": "string",
+      "enum": [
+        "TARGET_TYPE_UNSPECIFIED",
+        "TARGET_TYPE_IMAGE",
+        "TARGET_TYPE_K8S",
+        "TARGET_TYPE_DOCKER_COMPOSE",
+        "TARGET_TYPE_LOCAL"
+      ],
+      "default": "TARGET_TYPE_UNSPECIFIED",
+      "title": "Correspond to implementations of the TargetSpec interface"
+    },
+    "webviewTiltBuild": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": "string"
+        },
+        "commitSHA": {
+          "type": "string"
+        },
+        "date": {
+          "type": "string"
+        },
+        "dev": {
+          "type": "boolean",
+          "format": "boolean"
+        }
+      }
+    },
+    "webviewUpdateType": {
+      "type": "string",
+      "enum": [
+        "UPDATE_TYPE_UNSPECIFIED",
+        "UPDATE_TYPE_IMAGE",
+        "UPDATE_TYPE_LIVE_UPDATE",
+        "UPDATE_TYPE_DOCKER_COMPOSE",
+        "UPDATE_TYPE_K8S",
+        "UPDATE_TYPE_LOCAL"
+      ],
+      "default": "UPDATE_TYPE_UNSPECIFIED",
+      "title": "Correspond to BuildAndDeployers"
+    },
+    "webviewUploadSnapshotResponse": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "type": "string"
+        }
+      }
+    },
+    "webviewVersionSettings": {
+      "type": "object",
+      "properties": {
+        "check_updates": {
+          "type": "boolean",
+          "format": "boolean"
+        }
+      }
+    },
+    "webviewView": {
+      "type": "object",
+      "properties": {
+        "log": {
+          "type": "string"
+        },
+        "resources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/webviewResource"
+          }
+        },
+        "DEPRECATED_log_timestamps": {
+          "type": "boolean",
+          "format": "boolean",
+          "description": "We used to have a setting that allowed users to dynamically\nprepend timestamps in logs."
+        },
+        "feature_flags": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "boolean",
+            "format": "boolean"
+          }
+        },
+        "needs_analytics_nudge": {
+          "type": "boolean",
+          "format": "boolean"
+        },
+        "running_tilt_build": {
+          "$ref": "#/definitions/webviewTiltBuild"
+        },
+        "latest_tilt_build": {
+          "$ref": "#/definitions/webviewTiltBuild"
+        },
+        "version_settings": {
+          "$ref": "#/definitions/webviewVersionSettings"
+        },
+        "tilt_cloud_username": {
+          "type": "string"
+        },
+        "tilt_cloud_schemeHost": {
+          "type": "string"
+        },
+        "tilt_cloud_teamID": {
+          "type": "string"
+        },
+        "fatal_error": {
+          "type": "string"
+        },
+        "log_list": {
+          "$ref": "#/definitions/webviewLogList"
+        },
+        "tilt_start_time": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Allows us to synchronize on a running Tilt intance,\nso we can tell when Tilt restarted."
+        }
+      }
+    },
+    "webviewYAMLResourceInfo": {
+      "type": "object",
+      "properties": {
+        "k8s_resources": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

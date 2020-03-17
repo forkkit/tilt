@@ -18,6 +18,8 @@ import (
 // TODO(nick): We should probably get rid of ManifestName completely and just use TargetName everywhere.
 type ManifestName string
 
+const TiltfileManifestName = ManifestName("(Tiltfile)")
+
 func (m ManifestName) String() string         { return string(m) }
 func (m ManifestName) TargetName() TargetName { return TargetName(m) }
 
@@ -36,6 +38,10 @@ type Manifest struct {
 	// - automatically, when we detect a change
 	// - manually, when the user tells us to
 	TriggerMode TriggerMode
+
+	// The resource in this manifest will not be built until all of its dependencies have been
+	// ready at least once.
+	ResourceDependencies []ManifestName
 }
 
 func (m Manifest) ID() TargetID {
@@ -136,7 +142,9 @@ func (m Manifest) TargetSpecs() []TargetSpec {
 	for _, t := range m.ImageTargets {
 		result = append(result, t)
 	}
-	result = append(result, m.deployTarget)
+	if m.deployTarget != nil {
+		result = append(result, m.deployTarget)
+	}
 	return result
 }
 
@@ -155,13 +163,16 @@ func (m Manifest) LocalPaths() []string {
 	switch di := m.deployTarget.(type) {
 	case DockerComposeTarget:
 		return di.LocalPaths()
-	default:
+	case LocalTarget:
+		return di.Dependencies()
+	case ImageTarget, K8sTarget:
 		paths := []string{}
 		for _, iTarget := range m.ImageTargets {
 			paths = append(paths, iTarget.LocalPaths()...)
 		}
 		return sliceutils.DedupedAndSorted(paths)
 	}
+	panic(fmt.Sprintf("Unknown deploy target type (%T) while trying to get LocalPaths", m.deployTarget))
 }
 
 func (m Manifest) Validate() error {
@@ -187,22 +198,22 @@ func (m Manifest) Validate() error {
 }
 
 func (m1 Manifest) Equal(m2 Manifest) bool {
-	primitivesEq, dockerEq, k8sEq, dcEq, localEq := m1.fieldGroupsEqual(m2)
-	return primitivesEq && dockerEq && k8sEq && dcEq && localEq
+	primitivesEq, dockerEq, k8sEq, dcEq, localEq, depsEq := m1.fieldGroupsEqual(m2)
+	return primitivesEq && dockerEq && k8sEq && dcEq && localEq && depsEq
 }
 
 // ChangesInvalidateBuild checks whether the changes from old => new manifest
 // invalidate our build of the old one; i.e. if we're replacing `old` with `new`,
 // should we perform a full rebuild?
 func ChangesInvalidateBuild(old, new Manifest) bool {
-	_, dockerEq, k8sEq, dcEq, localEq := old.fieldGroupsEqual(new)
+	_, dockerEq, k8sEq, dcEq, localEq, _ := old.fieldGroupsEqual(new)
 
 	// We only need to update for this manifest if any of the field-groups
 	// affecting build+deploy have changed (i.e. a change in primitives doesn't matter)
 	return !dockerEq || !k8sEq || !dcEq || !localEq
 
 }
-func (m1 Manifest) fieldGroupsEqual(m2 Manifest) (primitivesEq, dockerEq, k8sEq, dcEq, localEq bool) {
+func (m1 Manifest) fieldGroupsEqual(m2 Manifest) (primitivesEq, dockerEq, k8sEq, dcEq, localEq, depsEq bool) {
 	primitivesEq = m1.Name == m2.Name && m1.TriggerMode == m2.TriggerMode
 
 	dockerEq = DeepEqual(m1.ImageTargets, m2.ImageTargets)
@@ -219,7 +230,9 @@ func (m1 Manifest) fieldGroupsEqual(m2 Manifest) (primitivesEq, dockerEq, k8sEq,
 	lt2 := m2.LocalTarget()
 	localEq = DeepEqual(lt1, lt2)
 
-	return primitivesEq, dockerEq, dcEq, k8sEq, localEq
+	depsEq = DeepEqual(m1.ResourceDependencies, m2.ResourceDependencies)
+
+	return primitivesEq, dockerEq, dcEq, k8sEq, localEq, depsEq
 }
 
 func (m Manifest) ManifestName() ManifestName {
@@ -228,6 +241,17 @@ func (m Manifest) ManifestName() ManifestName {
 
 func (m Manifest) Empty() bool {
 	return m.Equal(Manifest{})
+}
+
+func LocalRefSelectorsForManifests(manifests []Manifest) []container.RefSelector {
+	var res []container.RefSelector
+	for _, m := range manifests {
+		for _, iTarg := range m.ImageTargets {
+			sel := container.NameSelector(iTarg.Refs.LocalRef()).WithNameMatch()
+			res = append(res, sel)
+		}
+	}
+	return res
 }
 
 var _ TargetSpec = Manifest{}
@@ -322,7 +346,7 @@ func (c Cmd) String() string {
 			quoted[i] = arg
 		}
 	}
-	return fmt.Sprintf("%s", strings.Join(quoted, " "))
+	return strings.Join(quoted, " ")
 }
 
 func (c Cmd) Empty() bool {
@@ -357,12 +381,15 @@ func ToRuns(cmds []Cmd) []Run {
 }
 
 type PortForward struct {
-	// The port to expose on localhost of the current machine.
-	LocalPort int
-
 	// The port to connect to inside the deployed container.
 	// If 0, we will connect to the first containerPort.
 	ContainerPort int
+
+	// The port to expose on the current machine.
+	LocalPort int
+
+	// Optional host to bind to on the current machine (localhost by default)
+	Host string
 }
 
 var imageTargetAllowUnexported = cmp.AllowUnexported(ImageTarget{})
@@ -371,6 +398,8 @@ var labelRequirementAllowUnexported = cmp.AllowUnexported(labels.Requirement{})
 var k8sTargetAllowUnexported = cmp.AllowUnexported(K8sTarget{})
 var localTargetAllowUnexported = cmp.AllowUnexported(LocalTarget{})
 var selectorAllowUnexported = cmp.AllowUnexported(container.RefSelector{})
+var refSetAllowUnexported = cmp.AllowUnexported(container.RefSet{})
+var registryAllowUnexported = cmp.AllowUnexported(container.Registry{})
 
 var dockerRefEqual = cmp.Comparer(func(a, b reference.Named) bool {
 	aNil := a == nil
@@ -395,5 +424,7 @@ func DeepEqual(x, y interface{}) bool {
 		k8sTargetAllowUnexported,
 		localTargetAllowUnexported,
 		selectorAllowUnexported,
+		refSetAllowUnexported,
+		registryAllowUnexported,
 		dockerRefEqual)
 }

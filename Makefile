@@ -1,6 +1,5 @@
-.PHONY: all proto install lint test test-go check-js test-js integration wire-check wire ensure check-go goimports
+.PHONY: all proto install lint test test-go check-js test-js integration wire-check wire ensure check-go goimports proto-webview proto-webview-ts vendor shellcheck
 
-check-go: lint errcheck verify_goimports wire-check test-go
 all: check-go check-js test-js
 
 # There are 2 Go bugs that cause problems on CI:
@@ -19,24 +18,22 @@ CIRCLECI := $(if $(CIRCLECI),$(CIRCLECI),false)
 
 GOIMPORTS_LOCAL_ARG := -local github.com/windmilleng/tilt
 
-scripts/protocc/protocc.py: scripts/protocc
-	git submodule init
-	git submodule update
+proto:
+	toast synclet-proto
+	toast proto-ts
 
-proto: scripts/protocc/protocc.py
-	python3 scripts/protocc/protocc.py --out go
-
-# Build a binary that uses synclet:latest
+# Build a binary that uses the synclet tag specified in sidecar.go
 install:
-	go install ./cmd/tilt/...
+	go install -mod vendor -ldflags "-X 'github.com/windmilleng/tilt/internal/cli.commitSHA=$$(git merge-base master HEAD)'" ./cmd/tilt/...
 
+# Build a binary that uses a dev synclet image produced by `make synclet-dev`
 install-dev:
 	@if ! [[ -e "$(SYNCLET_DEV_IMAGE_TAG_FILE)" ]]; then echo "No dev synclet found. Run make synclet-dev."; exit 1; fi
-	go install -ldflags "-X 'github.com/windmilleng/tilt/internal/synclet/sidecar.SyncletTag=$$(<$(SYNCLET_DEV_IMAGE_TAG_FILE))'" ./...
+	go install -mod vendor -ldflags "-X 'github.com/windmilleng/tilt/internal/synclet/sidecar.SyncletTag=$$(<$(SYNCLET_DEV_IMAGE_TAG_FILE))'" ./...
 
 # disable optimizations and inlining, to allow more complete information when attaching a debugger or capturing a profile
 install-debug:
-	go install -gcflags "all=-N -l" ./...
+	go install -mod vendor -gcflags "all=-N -l" ./...
 
 define synclet-build-dev
 	echo $1 > $(SYNCLET_DEV_IMAGE_TAG_FILE)
@@ -50,77 +47,90 @@ synclet-dev: synclet-cache
 
 build-synclet-and-install: synclet-dev install-dev
 
-lint:
-	go vet -all -printfuncs=Verbosef,Infof,Debugf,PrintColorf ./...
+lint: golangci-lint
 
 build:
-	go test -p $(GO_PARALLEL_JOBS) -timeout 60s ./... -run nonsenseregex
+	go test -mod vendor -p $(GO_PARALLEL_JOBS) -timeout 60s ./... -run nonsenseregex
 
 test-go:
 ifneq ($(CIRCLECI),true)
-		go test -p $(GO_PARALLEL_JOBS) -timeout 80s ./...
+		go test -mod vendor -p $(GO_PARALLEL_JOBS) -timeout 80s ./...
 else
 		mkdir -p test-results
-		gotestsum --format standard-quiet --junitfile test-results/unit-tests.xml -- ./... -p $(GO_PARALLEL_JOBS) -timeout 80s
+		gotestsum --format standard-quiet --junitfile test-results/unit-tests.xml -- ./... -mod vendor -p $(GO_PARALLEL_JOBS) -timeout 80s
+endif
+
+test-go-helm-only:
+ifneq ($(CIRCLECI),true)
+		go test -mod vendor -p $(GO_PARALLEL_JOBS) -timeout 80s ./internal/tiltfile -run "(?i)(.*)Helm(.*)"
+else
+		mkdir -p test-results
+		gotestsum --format standard-quiet --junitfile test-results/unit-tests.xml -- ./internal/tiltfile -mod vendor -p $(GO_PARALLEL_JOBS) -timeout 80s -run "(?i)(.*)Helm(.*)"
 endif
 
 test: test-go test-js
 
 # skip some tests that are slow and not always relevant
 shorttest:
-	go test -p $(GO_PARALLEL_JOBS) -tags 'skipcontainertests' -timeout 60s ./...
+	# TODO(matt) skipdockercomposetests only skips the tiltfile DC tests at the moment
+	# we might also want to skip the ones in engine
+	go test -mod vendor -p $(GO_PARALLEL_JOBS) -tags skipcontainertests,skipdockercomposetests -timeout 60s ./...
+
+shorttestsum:
+	gotestsum -- -mod vendor -p $(GO_PARALLEL_JOBS) -tags skipcontainertests,skipdockercomposetests -timeout 60s ./...
 
 integration:
 ifneq ($(CIRCLECI),true)
-		go test -p $(GO_PARALLEL_JOBS) -tags 'integration' -timeout 700s ./integration
+		go test -mod vendor -v -count 1 -p $(GO_PARALLEL_JOBS) -tags 'integration' -timeout 700s ./integration
 else
 		mkdir -p test-results
-		gotestsum --format standard-quiet --junitfile test-results/unit-tests.xml -- ./integration -p $(GO_PARALLEL_JOBS) -tags 'integration' -timeout 700s
+		gotestsum --format standard-quiet --junitfile test-results/unit-tests.xml -- ./integration -mod vendor -count 1 -p $(GO_PARALLEL_JOBS) -tags 'integration' -timeout 700s
 endif
 
 # Run the integration tests on kind
 integration-kind:
-	kind create cluster --name=integration
-	KUBECONFIG="$(kind get kubeconfig-path --name="integration")" go test -p $(GO_PARALLEL_JOBS) -tags 'integration' -timeout 700s ./integration
+	KIND_CLUSTER_NAME=integration ./integration/kind-with-registry.sh
+	KUBECONFIG="$(kind get kubeconfig-path --name="integration")" go test -mod vendor -p $(GO_PARALLEL_JOBS) -tags 'integration' -timeout 700s ./integration -count 1
 	kind delete cluster --name=integration
 
 dev-js:
 	cd web && yarn install && yarn run start
 
 check-js:
-	cd web && yarn install
+	cd web && yarn install --frozen-lockfile
 	cd web && yarn run check
 
 build-js:
-	cd web && yarn install
+	cd web && yarn install --frozen-lockfile
 	cd web && yarn build
 
 test-js:
-	cd web && yarn install
+	cd web && yarn install --frozen-lockfile
+ifneq ($(CIRCLECI),true)
 	cd web && CI=true yarn test
-
-ensure:
-	dep ensure
+else
+	cd web && CI=true yarn ci
+endif
 
 goimports:
 	goimports -w -l $(GOIMPORTS_LOCAL_ARG) $$(go list -f {{.Dir}} ./...)
 
-verify_goimports:
-	# any files printed here need to be formatted by running `make goimports`
-	bash -c 'diff <(goimports -l $(GOIMPORTS_LOCAL_ARG) $$(go list -f {{.Dir}} ./...)) <(echo -n)'
-
 benchmark:
-	go test -run=XXX -bench=. ./...
+	go test -mod vendor -run=XXX -bench=. ./...
 
-errcheck:
-	errcheck -ignoretests -ignoregenerated ./...
+golangci-lint:
+ifneq ($(CIRCLECI),true)
+	GOFLAGS="-mod=vendor" golangci-lint run -v --timeout 90s
+else
+	mkdir -p test-results
+	GOFLAGS="-mod=vendor" golangci-lint run -v --timeout 90s --out-format junit-xml > test-results/lint.xml
+endif
 
-timing: install
-	./scripts/timing.py
-
-WIRE_PATHS = engine cli synclet
 wire:
-	$(foreach path,$(WIRE_PATHS),wire ./internal/$(path) && goimports -w $(GOIMPORTS_LOCAL_ARG) internal/$(path) &&) true
+	toast wire
+
+wire-dev:
+	wire ./internal/engine && wire ./internal/cli && wire ./internal/synclet
 
 wire-check:
 	wire check ./internal/engine
@@ -165,3 +175,23 @@ prettier:
 storybook:
 	cd web && yarn install
 	cd web && yarn storybook
+
+tilt-toast-container:
+	docker build -t gcr.io/windmill-public-containers/tilt-toast -f Dockerfile.toast .circleci
+	docker push gcr.io/windmill-public-containers/tilt-toast
+
+ensure: vendor
+
+vendor:
+	go mod vendor
+
+cli-docs:
+	rm -fR ../tilt.build/docs/cli
+	mkdir ../tilt.build/docs/cli
+	tilt dump cli-docs --dir=../tilt.build/docs/cli
+
+test_install_version_check: install
+	NO_INSTALL=1 PATH="~/go/bin:$$PATH" scripts/install.sh
+
+shellcheck:
+	find ./scripts -type f -name '*.sh' -exec docker run --rm -it -v $$(pwd):/mnt nlknguyen/alpine-shellcheck {} \;

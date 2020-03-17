@@ -15,14 +15,30 @@ import (
 
 type RuntimeState interface {
 	RuntimeState()
+
+	// There are two types of resource dependencies:
+	// - servers (Deployments) where what's important is that the server is running
+	// - tasks (Jobs, local resources) where what's important is that the job completed
+	// Currently, we don't try to distinguish between these two cases.
+	//
+	// In the future, it might make sense to check "IsBlocking()" or something,
+	// and alter the behavior based on whether the underlying resource is a server
+	// or a task.
+	HasEverBeenReadyOrSucceeded() bool
 }
 
-// Currently just a placeholder, as a LocalResource has no runtime state, only "build"
-// state. In future, we may use this to store runtime state for long-running processes
-// kicked off via a LocalResource.
-type LocalRuntimeState struct{}
+type LocalRuntimeState struct {
+	Status                  model.RuntimeStatus
+	HasSucceededAtLeastOnce bool
+	PID                     int
+	SpanID                  model.LogSpanID
+}
 
 func (LocalRuntimeState) RuntimeState() {}
+
+func (l LocalRuntimeState) HasEverBeenReadyOrSucceeded() bool {
+	return l.HasSucceededAtLeastOnce
+}
 
 var _ RuntimeState = LocalRuntimeState{}
 
@@ -32,9 +48,12 @@ type K8sRuntimeState struct {
 	// In many cases, this will be a Deployment UID.
 	PodAncestorUID types.UID
 
-	Pods           map[k8s.PodID]*Pod
-	LBs            map[k8s.ServiceName]*url.URL
-	DeployedUIDSet UIDSet
+	Pods                           map[k8s.PodID]*Pod
+	LBs                            map[k8s.ServiceName]*url.URL
+	DeployedUIDSet                 UIDSet                 // for the most recent successful deploy
+	DeployedPodTemplateSpecHashSet PodTemplateSpecHashSet // for the most recent successful deploy
+
+	LastReadyOrSucceededTime time.Time
 }
 
 func (K8sRuntimeState) RuntimeState() {}
@@ -48,10 +67,15 @@ func NewK8sRuntimeState(pods ...Pod) K8sRuntimeState {
 		podMap[p.PodID] = &p
 	}
 	return K8sRuntimeState{
-		Pods:           podMap,
-		LBs:            make(map[k8s.ServiceName]*url.URL),
-		DeployedUIDSet: NewUIDSet(),
+		Pods:                           podMap,
+		LBs:                            make(map[k8s.ServiceName]*url.URL),
+		DeployedUIDSet:                 NewUIDSet(),
+		DeployedPodTemplateSpecHashSet: NewPodTemplateSpecHashSet(),
 	}
+}
+
+func (s K8sRuntimeState) HasEverBeenReadyOrSucceeded() bool {
+	return !s.LastReadyOrSucceededTime.IsZero()
 }
 
 func (s K8sRuntimeState) PodLen() int {
@@ -89,6 +113,16 @@ func (s K8sRuntimeState) MostRecentPod() Pod {
 	return bestPod
 }
 
+func (s K8sRuntimeState) HasOKPodTemplateSpecHash(pod *v1.Pod) bool {
+	// if it doesn't have a label, just let it through - maybe it's from a CRD w/ no pod template spec
+	hash, ok := pod.Labels[k8s.TiltPodTemplateHashLabel]
+	if !ok {
+		return true
+	}
+
+	return s.DeployedPodTemplateSpecHashSet.Contains(k8s.PodTemplateSpecHash(hash))
+}
+
 type Pod struct {
 	PodID     k8s.PodID
 	Namespace k8s.Namespace
@@ -108,14 +142,15 @@ type Pod struct {
 
 	HasSynclet bool
 
-	// The log for the currently active pod, if any
-	CurrentLog model.Log `testdiff:"ignore"`
-
 	Containers []Container
 
 	// We want to show the user # of restarts since some baseline time
 	// i.e. Total Restarts - BaselineRestarts
 	BaselineRestarts int
+
+	Conditions []v1.PodCondition
+
+	SpanID model.LogSpanID
 }
 
 type Container struct {
@@ -123,6 +158,7 @@ type Container struct {
 	ID       container.ID
 	Ports    []int32
 	Ready    bool
+	Running  bool
 	ImageRef reference.Named
 	Restarts int
 }
@@ -145,10 +181,6 @@ func (p Pod) isAfter(p2 Pod) bool {
 	return p.PodID > p2.PodID
 }
 
-func (p Pod) Log() model.Log {
-	return p.CurrentLog
-}
-
 func (p Pod) AllContainerPorts() []int32 {
 	result := make([]int32, 0)
 	for _, c := range p.Containers {
@@ -158,6 +190,10 @@ func (p Pod) AllContainerPorts() []int32 {
 }
 
 func (p Pod) AllContainersReady() bool {
+	if len(p.Containers) == 0 {
+		return false
+	}
+
 	for _, c := range p.Containers {
 		if !c.Ready {
 			return false
@@ -192,4 +228,20 @@ func (s UIDSet) Add(uids ...types.UID) {
 
 func (s UIDSet) Contains(uid types.UID) bool {
 	return s[uid]
+}
+
+type PodTemplateSpecHashSet map[k8s.PodTemplateSpecHash]bool
+
+func NewPodTemplateSpecHashSet() PodTemplateSpecHashSet {
+	return make(map[k8s.PodTemplateSpecHash]bool)
+}
+
+func (s PodTemplateSpecHashSet) Add(hashes ...k8s.PodTemplateSpecHash) {
+	for _, hash := range hashes {
+		s[hash] = true
+	}
+}
+
+func (s PodTemplateSpecHashSet) Contains(hash k8s.PodTemplateSpecHash) bool {
+	return s[hash]
 }

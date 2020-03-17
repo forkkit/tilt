@@ -7,7 +7,7 @@ import (
 
 	"github.com/windmilleng/tilt/internal/hud/view"
 	"github.com/windmilleng/tilt/internal/rty"
-	"github.com/windmilleng/tilt/pkg/model"
+	"github.com/windmilleng/tilt/pkg/model/logstore"
 )
 
 type TabView struct {
@@ -36,29 +36,39 @@ func (v *TabView) Build() rty.Component {
 }
 
 func (v *TabView) log() string {
-	var ret model.Log
+	var numLinesNeeded = logLineCount
+	if v.viewState.TiltLogState == view.TiltLogShort {
+		numLinesNeeded = defaultLogPaneHeight
+	}
+
+	var spanID logstore.SpanID
 	switch v.tabState {
-	case view.TabAllLog:
-		ret = v.view.Log
 	case view.TabBuildLog:
 		_, resource := selectedResource(v.view, v.viewState)
 		if !resource.CurrentBuild.Empty() {
-			ret = resource.CurrentBuild.Log
+			spanID = resource.CurrentBuild.SpanID
 		} else {
-			ret = resource.LastBuild().Log
+			spanID = resource.LastBuild().SpanID
 		}
-	case view.TabPodLog:
+	case view.TabRuntimeLog:
 		_, resource := selectedResource(v.view, v.viewState)
 		if resource.ResourceInfo != nil {
-			ret = resource.ResourceInfo.RuntimeLog()
+			spanID = resource.ResourceInfo.RuntimeSpanID()
 		}
 	}
 
-	if !ret.Empty() {
-		return ret.Tail(logLineCount).String()
-	} else {
+	reader := v.view.LogReader
+	result := ""
+	if v.tabState == view.TabAllLog {
+		result = reader.Tail(numLinesNeeded)
+	} else if spanID != "" {
+		result = reader.TailSpan(numLinesNeeded, spanID)
+	}
+
+	if result == "" {
 		return "(no logs received)"
 	}
+	return result
 }
 
 func (v *TabView) buildTab(text string) rty.Component {
@@ -79,10 +89,10 @@ func (v *TabView) buildTabs(isMax bool) rty.Component {
 		l.Add(v.buildTab("2: build log"))
 	}
 	l.Add(rty.TextString("│"))
-	if v.tabState == view.TabPodLog {
-		l.Add(v.buildTab("3: POD LOG"))
+	if v.tabState == view.TabRuntimeLog {
+		l.Add(v.buildTab("3: RUNTIME LOG"))
 	} else {
-		l.Add(v.buildTab("3: pod log"))
+		l.Add(v.buildTab("3: runtime log"))
 	}
 	l.Add(rty.TextString("│ "))
 	l.Add(renderPaneHeader(isMax))

@@ -2,8 +2,10 @@ package testutils
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
+	"testing"
 
 	"github.com/windmilleng/wmclient/pkg/analytics"
 
@@ -17,7 +19,8 @@ func CtxAndAnalyticsForTest() (context.Context, *analytics.MemoryAnalytics, *til
 	l := logger.NewLogger(logger.DebugLvl, os.Stdout)
 	ctx := logger.WithLogger(context.Background(), l)
 
-	ma, ta := tiltanalytics.NewMemoryTiltAnalyticsForTest(tiltanalytics.NullOpter{})
+	opter := tiltanalytics.NewFakeOpter(analytics.OptIn)
+	ma, ta := tiltanalytics.NewMemoryTiltAnalyticsForTest(opter)
 	ctx = tiltanalytics.WithAnalytics(ctx, ta)
 
 	return ctx, ma, ta
@@ -37,5 +40,13 @@ func ForkedCtxAndAnalyticsWithOpterForTest(w io.Writer, o tiltanalytics.Analytic
 // CtxForTest returns a context.Context suitable for use in tests (i.e. with
 // logger attached), and with all output being copied to `w`
 func ForkedCtxAndAnalyticsForTest(w io.Writer) (context.Context, *analytics.MemoryAnalytics, *tiltanalytics.TiltAnalytics) {
-	return ForkedCtxAndAnalyticsWithOpterForTest(w, tiltanalytics.NullOpter{})
+	opter := tiltanalytics.NewFakeOpter(analytics.OptIn)
+	return ForkedCtxAndAnalyticsWithOpterForTest(w, opter)
+}
+
+func FailOnNonCanceledErr(t *testing.T, err error, message string) {
+	if err != nil && err != context.Canceled {
+		fmt.Printf("%s: %v\n", message, err)
+		t.Error(err)
+	}
 }

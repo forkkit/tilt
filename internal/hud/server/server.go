@@ -1,15 +1,22 @@
 package server
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
+	_ "net/http/pprof"
 	"time"
+	"unsafe"
 
 	"github.com/gorilla/mux"
 	_ "github.com/gorilla/websocket"
+	"github.com/grpc-ecosystem/grpc-gateway/runtime"
+	jsoniter "github.com/json-iterator/go"
+	"github.com/pkg/errors"
 	"github.com/windmilleng/wmclient/pkg/analytics"
 
 	tiltanalytics "github.com/windmilleng/tilt/internal/analytics"
@@ -19,6 +26,7 @@ import (
 	"github.com/windmilleng/tilt/internal/store"
 	"github.com/windmilleng/tilt/pkg/assets"
 	"github.com/windmilleng/tilt/pkg/model"
+	proto_webview "github.com/windmilleng/tilt/pkg/webview"
 )
 
 const httpTimeOut = 5 * time.Second
@@ -35,7 +43,8 @@ type analyticsOptPayload struct {
 }
 
 type triggerPayload struct {
-	ManifestNames []string `json:"manifest_names"`
+	ManifestNames []string          `json:"manifest_names"`
+	BuildReason   model.BuildReason `json:"build_reason"`
 }
 
 type actionPayload struct {
@@ -46,25 +55,31 @@ type actionPayload struct {
 }
 
 type HeadsUpServer struct {
+	ctx               context.Context
 	store             *store.Store
 	router            *mux.Router
 	a                 *tiltanalytics.TiltAnalytics
+	uploader          cloud.SnapshotUploader
 	numWebsocketConns int32
-	httpCli           httpClient
-	cloudAddress      string
 }
 
-func ProvideHeadsUpServer(store *store.Store, assetServer assets.Server, analytics *tiltanalytics.TiltAnalytics, httpClient httpClient, cloudAddress cloud.Address) *HeadsUpServer {
+func ProvideHeadsUpServer(
+	ctx context.Context,
+	store *store.Store,
+	assetServer assets.Server,
+	analytics *tiltanalytics.TiltAnalytics,
+	uploader cloud.SnapshotUploader) (*HeadsUpServer, error) {
 	r := mux.NewRouter().UseEncodedPath()
 	s := &HeadsUpServer{
-		store:        store,
-		router:       r,
-		a:            analytics,
-		httpCli:      httpClient,
-		cloudAddress: string(cloudAddress),
+		ctx:      ctx,
+		store:    store,
+		router:   r,
+		a:        analytics,
+		uploader: uploader,
 	}
 
 	r.HandleFunc("/api/view", s.ViewJSON)
+	r.HandleFunc("/api/dump/engine", s.DumpEngineJSON)
 	r.HandleFunc("/api/analytics", s.HandleAnalytics)
 	r.HandleFunc("/api/analytics_opt", s.HandleAnalyticsOpt)
 	r.HandleFunc("/api/trigger", s.HandleTrigger)
@@ -74,10 +89,11 @@ func ProvideHeadsUpServer(store *store.Store, assetServer assets.Server, analyti
 	r.HandleFunc("/api/snapshot/{snapshot_id}", s.SnapshotJSON)
 	r.HandleFunc("/ws/view", s.ViewWebsocket)
 	r.HandleFunc("/api/user_started_tilt_cloud_registration", s.userStartedTiltCloudRegistration)
+	r.HandleFunc("/api/set_tiltfile_args", s.HandleSetTiltfileArgs).Methods("POST")
 
 	r.PathPrefix("/").Handler(s.cookieWrapper(assetServer))
 
-	return s
+	return s, nil
 }
 
 type funcHandler struct {
@@ -103,27 +119,45 @@ func (s *HeadsUpServer) Router() http.Handler {
 
 func (s *HeadsUpServer) ViewJSON(w http.ResponseWriter, req *http.Request) {
 	state := s.store.RLockState()
-	view := webview.StateToWebView(state)
+	view, err := webview.StateToProtoView(state, 0)
 	s.store.RUnlockState()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error converting view to proto: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	jsEncoder := &runtime.JSONPb{OrigName: false, EmitDefaults: true}
 
 	w.Header().Set("Content-Type", "application/json")
-	err := json.NewEncoder(w).Encode(view)
+	err = jsEncoder.NewEncoder(w).Encode(view)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Error rendering view payload: %v", err), http.StatusInternalServerError)
 	}
 }
 
-type snapshot struct {
-	View webview.View
+// Dump the JSON engine over http. Only intended for 'tilt dump engine'.
+func (s *HeadsUpServer) DumpEngineJSON(w http.ResponseWriter, req *http.Request) {
+	state := s.store.RLockState()
+	defer s.store.RUnlockState()
+
+	encoder := store.CreateEngineStateEncoder(w)
+	err := encoder.Encode(state)
+	if err != nil {
+		log.Printf("Error encoding: %v", err)
+	}
 }
 
 func (s *HeadsUpServer) SnapshotJSON(w http.ResponseWriter, req *http.Request) {
 	state := s.store.RLockState()
-	view := webview.StateToWebView(state)
+	view, err := webview.StateToProtoView(state, 0)
 	s.store.RUnlockState()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error converting view to proto: %v", err), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	err := json.NewEncoder(w).Encode(snapshot{
+	err = json.NewEncoder(w).Encode(&proto_webview.Snapshot{
 		View: view,
 	})
 	if err != nil {
@@ -153,10 +187,10 @@ func (s *HeadsUpServer) HandleAnalyticsOpt(w http.ResponseWriter, req *http.Requ
 
 	// only logging on opt-in, because, well, opting out means the user just told us not to report data on them!
 	if opt == analytics.OptIn {
-		s.a.IncrIfUnopted("analytics.opt.in")
+		s.a.Incr("analytics.opt.in", nil)
 	}
 
-	s.store.Dispatch(store.AnalyticsOptAction{Opt: opt})
+	s.store.Dispatch(store.AnalyticsUserOptAction{Opt: opt})
 }
 
 func (s *HeadsUpServer) HandleAnalytics(w http.ResponseWriter, req *http.Request) {
@@ -182,6 +216,16 @@ func (s *HeadsUpServer) HandleAnalytics(w http.ResponseWriter, req *http.Request
 
 		s.a.Incr(p.Name, p.Tags)
 	}
+}
+
+func (s *HeadsUpServer) HandleSetTiltfileArgs(w http.ResponseWriter, req *http.Request) {
+	var args []string
+	err := jsoniter.NewDecoder(req.Body).Decode(&args)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("error parsing JSON payload: %v", err), http.StatusBadRequest)
+	}
+
+	s.store.Dispatch(SetTiltfileArgsAction{args})
 }
 
 func (s *HeadsUpServer) DispatchAction(w http.ResponseWriter, req *http.Request) {
@@ -228,29 +272,25 @@ func (s *HeadsUpServer) HandleTrigger(w http.ResponseWriter, req *http.Request) 
 		return
 	}
 
-	err = MaybeSendToTriggerQueue(s.store, payload.ManifestNames[0])
+	err = SendToTriggerQueue(s.store, payload.ManifestNames[0], payload.BuildReason)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 }
 
-func MaybeSendToTriggerQueue(st store.RStore, name string) error {
+func SendToTriggerQueue(st store.RStore, name string, buildReason model.BuildReason) error {
 	mName := model.ManifestName(name)
 
 	state := st.RLockState()
-	m, ok := state.Manifest(mName)
+	_, ok := state.Manifest(mName)
 	st.RUnlockState()
 
 	if !ok {
 		return fmt.Errorf("no manifest found with name '%s'", mName)
 	}
 
-	if m.TriggerMode != model.TriggerModeManual {
-		return fmt.Errorf("can only trigger updates for manifests of TriggerModeManual")
-	}
-
-	st.Dispatch(AppendToTriggerQueueAction{Name: mName})
+	st.Dispatch(AppendToTriggerQueueAction{Name: mName, Reason: buildReason})
 	return nil
 }
 
@@ -258,22 +298,23 @@ func MaybeSendToTriggerQueue(st store.RStore, name string) error {
 type snapshotURLJson struct {
 	Url string `json:"url"`
 }
-type SnapshotID string
 
-type snapshotIDResponse struct {
-	ID string
-}
+// the default json decoding just blows up if a time.Time field is empty
+// this uses the default behavior, except empty string -> time.Time{}
+type timeAllowEmptyDecoder struct{}
 
-func (s *HeadsUpServer) templateSnapshotURL(id SnapshotID) string {
-	u := cloud.URL(s.cloudAddress)
-	u.Path = fmt.Sprintf("snapshot/%s", id)
-	return u.String()
-}
-
-func (s *HeadsUpServer) newSnapshotURL() string {
-	u := cloud.URL(s.cloudAddress)
-	u.Path = "/api/snapshot/new"
-	return u.String()
+func (codec timeAllowEmptyDecoder) Decode(ptr unsafe.Pointer, iter *jsoniter.Iterator) {
+	s := iter.ReadString()
+	var ret time.Time
+	if s != "" {
+		var err error
+		ret, err = time.Parse(time.RFC3339, s)
+		if err != nil {
+			iter.ReportError("timeAllowEmptyDecoder", errors.Wrapf(err, "decoding '%s'", s).Error())
+			return
+		}
+	}
+	*((*time.Time)(ptr)) = ret
 }
 
 func (s *HeadsUpServer) HandleNewSnapshot(w http.ResponseWriter, req *http.Request) {
@@ -282,64 +323,58 @@ func (s *HeadsUpServer) HandleNewSnapshot(w http.ResponseWriter, req *http.Reque
 	teamID := st.TeamName
 	s.store.RUnlockState()
 
-	request, err := http.NewRequest(http.MethodPost, s.newSnapshotURL(), req.Body)
+	b, err := ioutil.ReadAll(req.Body)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Error making request: %s", err.Error()), http.StatusInternalServerError)
+		msg := fmt.Sprintf("error reading body: %v", err)
+		log.Println(msg)
+		http.Error(w, msg, http.StatusInternalServerError)
 		return
 	}
 
-	request.Header.Set(cloud.TiltTokenHeaderName, token.String())
-	if teamID != "" {
-		request.Header.Set(cloud.TiltTeamIDNameHeaderName, teamID)
-	}
-	response, err := s.httpCli.Do(request)
+	jspb := &runtime.JSONPb{OrigName: false, EmitDefaults: true}
+	decoder := jspb.NewDecoder(bytes.NewBuffer(b))
+	var snapshot *proto_webview.Snapshot
+
+	// TODO(nick): Add more strict decoding once we have better safeguards for making
+	// sure the Go and JS types are in-sync.
+	// decoder.DisallowUnknownFields()
+
+	err = decoder.Decode(&snapshot)
 	if err != nil {
-		log.Printf("Error creating snapshot: %v\n", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		_, err := w.Write([]byte(err.Error()))
-		if err != nil {
-			log.Printf("Error writing error to response: %v\n", err)
-		}
+		msg := fmt.Sprintf("Error decoding snapshot: %v\n", err)
+		log.Println(msg)
+		http.Error(w, msg, http.StatusInternalServerError)
 		return
 	}
 
-	responseWithID, err := ioutil.ReadAll(response.Body)
+	id, err := s.uploader.Upload(token, teamID, snapshot)
 	if err != nil {
-		log.Printf("Error reading response when creating snapshot: %v\n", err)
-		log.Printf("Error reading responseWithID: %v\n", err)
-		w.WriteHeader(http.StatusInternalServerError)
+		msg := fmt.Sprintf("Error creating snapshot: %v", err)
+		log.Println(msg)
+		http.Error(w, msg, http.StatusInternalServerError)
 		return
 	}
 
-	//unpack response with snapshot ID
-	var resp snapshotIDResponse
-	err = json.Unmarshal(responseWithID, &resp)
-	if err != nil || resp.ID == "" {
-		log.Printf("Error unpacking snapshot response JSON: %v\nJSON: %s\n", err, responseWithID)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	//create URL with snapshot ID
-	var ID SnapshotID
-	ID = SnapshotID(resp.ID)
 	responsePayload := snapshotURLJson{
-		Url: s.templateSnapshotURL(ID),
+		Url: s.uploader.IDToSnapshotURL(id),
 	}
 
 	//encode URL to JSON format
 	urlJS, err := json.Marshal(responsePayload)
 	if err != nil {
-		log.Printf("Error to marshal url JSON response %v\n", err)
-		w.WriteHeader(http.StatusInternalServerError)
+		msg := fmt.Sprintf("Error to marshal url JSON response %v", err)
+		log.Println(msg)
+		http.Error(w, msg, http.StatusInternalServerError)
 		return
 	}
 
 	//write URL to header
-	w.WriteHeader(response.StatusCode)
+	w.WriteHeader(http.StatusOK)
 	_, err = w.Write(urlJS)
 	if err != nil {
-		log.Printf("Error writing URL response: %v\n", err)
+		msg := fmt.Sprintf("Error writing URL response: %v", err)
+		log.Println(msg)
+		http.Error(w, msg, http.StatusInternalServerError)
 		return
 	}
 
@@ -347,12 +382,4 @@ func (s *HeadsUpServer) HandleNewSnapshot(w http.ResponseWriter, req *http.Reque
 
 func (s *HeadsUpServer) userStartedTiltCloudRegistration(w http.ResponseWriter, req *http.Request) {
 	s.store.Dispatch(store.UserStartedTiltCloudRegistrationAction{})
-}
-
-type httpClient interface {
-	Do(*http.Request) (*http.Response, error)
-}
-
-func ProvideHttpClient() httpClient {
-	return http.DefaultClient
 }

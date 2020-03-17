@@ -7,15 +7,14 @@ import (
 	"strings"
 
 	tiltanalytics "github.com/windmilleng/tilt/internal/analytics"
+	"github.com/windmilleng/tilt/pkg/logger"
 
-	"github.com/spf13/cobra"
 	giturls "github.com/whilp/git-urls"
 
 	"github.com/windmilleng/wmclient/pkg/analytics"
 )
 
 const tiltAppName = "tilt"
-const disableAnalyticsEnvVar = "TILT_DISABLE_ANALYTICS"
 const analyticsURLEnvVar = "TILT_ANALYTICS_URL"
 
 // Testing analytics locally:
@@ -28,54 +27,54 @@ type analyticsOpter struct{}
 
 var _ tiltanalytics.AnalyticsOpter = analyticsOpter{}
 
-func (ao analyticsOpter) SetOpt(opt analytics.Opt) error {
+func (ao analyticsOpter) ReadUserOpt() (analytics.Opt, error) {
+	return analytics.OptStatus()
+}
+
+func (ao analyticsOpter) SetUserOpt(opt analytics.Opt) error {
 	return analytics.SetOpt(opt)
 }
 
-func initAnalytics(rootCmd *cobra.Command) (*tiltanalytics.TiltAnalytics, error) {
-	var analyticsCmd *cobra.Command
+type analyticsLogger struct {
+	logger logger.Logger
+}
+
+func (al analyticsLogger) Printf(fmt string, v ...interface{}) {
+	al.logger.Debugf(fmt, v...)
+}
+
+func newAnalytics(l logger.Logger) (*tiltanalytics.TiltAnalytics, error) {
 	var err error
 
 	options := []analytics.Option{}
 	// enabled: true because TiltAnalytics wraps the RemoteAnalytics and has its own guards for whether analytics
 	//   is enabled. When TiltAnalytics decides to pass a call through to RemoteAnalytics, it should always work.
-	options = append(options, analytics.WithGlobalTags(globalTags()), analytics.WithEnabled(true))
+	options = append(options,
+		analytics.WithGlobalTags(globalTags()),
+		analytics.WithEnabled(true),
+		analytics.WithLogger(analyticsLogger{logger: l}))
 	analyticsURL := os.Getenv(analyticsURLEnvVar)
 	if analyticsURL != "" {
 		options = append(options, analytics.WithReportURL(analyticsURL))
 	}
-	backingAnalytics, analyticsCmd, err := analytics.Init(tiltAppName, options...)
+	backingAnalytics, err := analytics.NewRemoteAnalytics(tiltAppName, options...)
 	if err != nil {
 		return nil, err
 	}
 
-	rootCmd.AddCommand(analyticsCmd)
-
-	var analyticsOpt analytics.Opt
-	if isAnalyticsDisabledFromEnv() {
-		analyticsOpt = analytics.OptOut
-	} else {
-		analyticsOpt, err = analytics.OptStatus()
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	a := tiltanalytics.NewTiltAnalytics(analyticsOpt, analyticsOpter{}, backingAnalytics, provideTiltInfo().AnalyticsVersion())
-
-	return a, nil
+	return tiltanalytics.NewTiltAnalytics(analyticsOpter{}, backingAnalytics, provideTiltInfo().AnalyticsVersion())
 }
 
 func globalTags() map[string]string {
 	ret := map[string]string{
-		"version": provideTiltInfo().AnalyticsVersion(),
-		"os":      runtime.GOOS,
+		tiltanalytics.TagVersion: provideTiltInfo().AnalyticsVersion(),
+		tiltanalytics.TagOS:      runtime.GOOS,
 	}
 
 	// store a hash of the git remote to help us guess how many users are running it on the same repository
 	origin := normalizeGitRemote(gitOrigin("."))
 	if origin != "" {
-		ret["git.origin"] = tiltanalytics.HashMD5(origin)
+		ret[tiltanalytics.TagGitRepoHash] = tiltanalytics.HashMD5(origin)
 	}
 
 	return ret
@@ -113,8 +112,4 @@ func normalizeGitRemote(s string) string {
 	}
 
 	return u.String()
-}
-
-func isAnalyticsDisabledFromEnv() bool {
-	return os.Getenv(disableAnalyticsEnvVar) != ""
 }

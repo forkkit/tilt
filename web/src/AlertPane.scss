@@ -1,13 +1,11 @@
 @import "constants";
 
 .AlertPane {
-  margin-top: $tabnav-height;
-  margin-right: $sidebar-width;
-  margin-bottom: $statusbar-height;
   padding: $spacing-unit / 2;
   width: 100%;
   display: flex;
   justify-content: center;
+  box-sizing: border-box;
 }
 
 .AlertPane ul {
@@ -61,14 +59,13 @@
 
 // Hide all lines by default
 .AlertPane-item code {
-  display: block;
+  display: none;
   white-space: pre-wrap;
-  height: 0;
-  opacity: 0;
 }
 
 // ...only show last few lines
 .AlertPane-item code:nth-last-child(-n + 8) {
+  display: inline;
   min-height: $spacing-unit / 2; // Respect blank lines
   height: auto;
   opacity: 1;

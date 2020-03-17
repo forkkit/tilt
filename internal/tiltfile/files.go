@@ -2,19 +2,17 @@ package tiltfile
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
-	"path/filepath"
 
 	"github.com/windmilleng/tilt/internal/k8s"
-	"github.com/windmilleng/tilt/internal/sliceutils"
+	tiltfile_io "github.com/windmilleng/tilt/internal/tiltfile/io"
+	"github.com/windmilleng/tilt/internal/tiltfile/starkit"
+	"github.com/windmilleng/tilt/internal/tiltfile/value"
 	"github.com/windmilleng/tilt/pkg/logger"
 
-	"github.com/ghodss/yaml"
 	"github.com/pkg/errors"
 	"go.starlark.net/starlark"
 
@@ -23,171 +21,28 @@ import (
 
 const localLogPrefix = " → "
 
-type gitRepo struct {
-	basePath    string
-	argUnpacker argUnpacker
-}
-
-func (s *tiltfileState) newGitRepo(t *starlark.Thread, path string) (*gitRepo, error) {
-	absPath := s.absPath(t, path)
-	_, err := os.Stat(absPath)
-	if err != nil {
-		return nil, fmt.Errorf("Reading paths %s: %v", absPath, err)
-	}
-
-	if _, err := os.Stat(filepath.Join(absPath, ".git")); os.IsNotExist(err) {
-		return nil, fmt.Errorf("%s isn't a valid git repo: it doesn't have a .git/ directory", absPath)
-	}
-
-	return &gitRepo{basePath: absPath, argUnpacker: s.unpackArgs}, nil
-}
-
-func (s *tiltfileState) localGitRepo(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var path string
-	err := s.unpackArgs(fn.Name(), args, kwargs, "paths", &path)
-	if err != nil {
-		return nil, err
-	}
-
-	return s.newGitRepo(thread, path)
-}
-
-var _ starlark.Value = &gitRepo{}
-
-func (gr *gitRepo) String() string {
-	return fmt.Sprintf("[gitRepo] '%v'", gr.basePath)
-}
-
-func (gr *gitRepo) Type() string {
-	return "gitRepo"
-}
-
-func (gr *gitRepo) Freeze() {}
-
-func (gr *gitRepo) Truth() starlark.Bool {
-	return gr.basePath != ""
-}
-
-func (*gitRepo) Hash() (uint32, error) {
-	return 0, errors.New("unhashable type: gitRepo")
-}
-
-func (gr *gitRepo) Attr(name string) (starlark.Value, error) {
-	switch name {
-	case "paths":
-		return starlark.NewBuiltin(name, gr.path), nil
-	default:
-		return nil, nil
-	}
-
-}
-
-func (gr *gitRepo) AttrNames() []string {
-	return []string{"paths"}
-}
-
-func (gr *gitRepo) path(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var path string
-	err := gr.argUnpacker(fn.Name(), args, kwargs, "paths", &path)
-	if err != nil {
-		return nil, err
-	}
-
-	return starlark.String(gr.makeLocalPath(path)), nil
-}
-
-func (gr *gitRepo) makeLocalPath(path string) string {
-	return filepath.Join(gr.basePath, path)
-}
-
-func (s *tiltfileState) absPathFromStarlarkValue(thread *starlark.Thread, v starlark.Value) (string, error) {
-	switch v := v.(type) {
-	case *gitRepo:
-		return v.makeLocalPath("."), nil
-	case starlark.String:
-		return s.absPath(thread, string(v)), nil
-	default:
-		return "", fmt.Errorf("expected gitRepo | string. Actual type: %T", v)
-	}
-}
-
-// When running the Tilt demo, the current working directory is arbitrary.
-// So we want to resolve paths relative to the dir where the Tiltfile lives,
-// not relative to the working directory.
-func (s *tiltfileState) absPath(t *starlark.Thread, path string) string {
-	if filepath.IsAbs(path) {
-		return path
-	}
-	return filepath.Join(s.absWorkingDir(t), path)
-}
-
-func (s *tiltfileState) absWorkingDir(t *starlark.Thread) string {
-	return filepath.Dir(s.currentTiltfilePath(t))
-}
-
-func (s *tiltfileState) recordConfigFile(f string) {
-	s.configFiles = sliceutils.AppendWithoutDupes(s.configFiles, f)
-}
-
-func (s *tiltfileState) readFile(p string) ([]byte, error) {
-	s.recordConfigFile(p)
-	return ioutil.ReadFile(p)
-}
-
-func (s *tiltfileState) watchFile(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var path starlark.Value
-	err := s.unpackArgs(fn.Name(), args, kwargs, "paths", &path)
-	if err != nil {
-		return nil, err
-	}
-
-	p, err := s.absPathFromStarlarkValue(thread, path)
-	if err != nil {
-		return nil, fmt.Errorf("invalid type for paths: %v", err)
-	}
-
-	s.recordConfigFile(p)
-
-	return starlark.None, nil
-}
-
-func (s *tiltfileState) skylarkReadFile(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var path starlark.Value
-	defaultReturn := ""
-	err := s.unpackArgs(fn.Name(), args, kwargs, "paths", &path, "default?", &defaultReturn)
-	if err != nil {
-		return nil, err
-	}
-
-	p, err := s.absPathFromStarlarkValue(thread, path)
-	if err != nil {
-		return nil, fmt.Errorf("invalid type for paths: %v", err)
-	}
-
-	bs, err := s.readFile(p)
-	if os.IsNotExist(err) {
-		bs = []byte(defaultReturn)
-	} else if err != nil {
-		return nil, err
-	}
-
-	return newBlob(string(bs), fmt.Sprintf("file: %s", p)), nil
-}
-
 func (s *tiltfileState) local(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var command string
-	err := s.unpackArgs(fn.Name(), args, kwargs, "command", &command)
+	var commandValue starlark.Value
+	quiet := false
+	err := s.unpackArgs(fn.Name(), args, kwargs,
+		"command", &commandValue,
+		"quiet?", &quiet,
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	s.logger.Infof("local: %s", command)
-	out, err := s.execLocalCmd(thread, exec.Command("sh", "-c", command), true)
+	cmd, err := value.ValueToCmd(commandValue)
+	if err != nil {
+		return nil, err
+	}
+	s.logger.Infof("local: %s", cmd)
+	out, err := s.execLocalCmd(thread, exec.Command(cmd.Argv[0], cmd.Argv[1:]...), !quiet)
 	if err != nil {
 		return nil, err
 	}
 
-	return newBlob(out, fmt.Sprintf("local: %s", command)), nil
+	return tiltfile_io.NewBlob(out, fmt.Sprintf("local: %s", cmd)), nil
 }
 
 func (s *tiltfileState) execLocalCmd(t *starlark.Thread, c *exec.Cmd, logOutput bool) (string, error) {
@@ -195,12 +50,12 @@ func (s *tiltfileState) execLocalCmd(t *starlark.Thread, c *exec.Cmd, logOutput 
 	stderr := bytes.NewBuffer(nil)
 
 	// TODO(nick): Should this also inject any docker.Env overrides?
-	c.Dir = s.absWorkingDir(t)
+	c.Dir = starkit.AbsWorkingDir(t)
 	c.Stdout = stdout
 	c.Stderr = stderr
 
 	if logOutput {
-		logOutput := NewMutexWriter(logger.NewPrefixedWriter(localLogPrefix, s.logger.Writer(logger.InfoLvl)))
+		logOutput := logger.NewMutexWriter(logger.NewPrefixedLogger(localLogPrefix, s.logger).Writer(logger.InfoLvl))
 		c.Stdout = io.MultiWriter(stdout, logOutput)
 		c.Stderr = io.MultiWriter(stderr, logOutput)
 	}
@@ -212,11 +67,7 @@ func (s *tiltfileState) execLocalCmd(t *starlark.Thread, c *exec.Cmd, logOutput 
 			return "", fmt.Errorf("command %q failed.\nerror: %v", c.Args, err)
 		}
 
-		errorMessage := fmt.Sprintf("command %q failed.\nerror: %v\nstdout: %q", c.Args, err, stdout.String())
-		exitError, ok := err.(*exec.ExitError)
-		if ok {
-			errorMessage += fmt.Sprintf("\nstderr: %q", string(exitError.Stderr))
-		}
+		errorMessage := fmt.Sprintf("command %q failed.\nerror: %v\nstdout: %q\nstderr: %q", c.Args, err, stdout.String(), stderr.String())
 		return "", errors.New(errorMessage)
 	}
 
@@ -234,12 +85,20 @@ func (s *tiltfileState) kustomize(thread *starlark.Thread, fn *starlark.Builtin,
 		return nil, err
 	}
 
-	kustomizePath, err := s.absPathFromStarlarkValue(thread, path)
+	kustomizePath, err := value.ValueToAbsPath(thread, path)
 	if err != nil {
 		return nil, fmt.Errorf("Argument 0 (paths): %v", err)
 	}
 
-	yaml, err := s.execLocalCmd(thread, exec.Command("kustomize", "build", kustomizePath), false)
+	cmd := []string{"kustomize", "build", kustomizePath}
+
+	_, err = exec.LookPath(cmd[0])
+	if err != nil {
+		s.logger.Infof("Falling back to `kubectl kustomize` since `kubectl` was not found in PATH")
+		cmd = []string{"kubectl", "kustomize", kustomizePath}
+	}
+
+	yaml, err := s.execLocalCmd(thread, exec.Command(cmd[0], cmd[1:]...), false)
 	if err != nil {
 		return nil, err
 	}
@@ -248,10 +107,13 @@ func (s *tiltfileState) kustomize(thread *starlark.Thread, fn *starlark.Builtin,
 		return nil, fmt.Errorf("internal error: %v", err)
 	}
 	for _, d := range deps {
-		s.recordConfigFile(d)
+		err := tiltfile_io.RecordReadFile(thread, d)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	return newBlob(yaml, fmt.Sprintf("kustomize: %s", kustomizePath)), nil
+	return tiltfile_io.NewBlob(yaml, fmt.Sprintf("kustomize: %s", kustomizePath)), nil
 }
 
 func (s *tiltfileState) helm(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
@@ -259,24 +121,31 @@ func (s *tiltfileState) helm(thread *starlark.Thread, fn *starlark.Builtin, args
 	var name string
 	var namespace string
 	var valueFilesV starlark.Value
+	var setV starlark.Value
 	err := s.unpackArgs(fn.Name(), args, kwargs,
 		"paths", &path,
 		"name?", &name,
 		"namespace?", &namespace,
-		"values?", &valueFilesV)
+		"values?", &valueFilesV,
+		"set?", &setV)
 	if err != nil {
 		return nil, err
 	}
 
-	localPath, err := s.absPathFromStarlarkValue(thread, path)
+	localPath, err := value.ValueToAbsPath(thread, path)
 	if err != nil {
 		return nil, fmt.Errorf("Argument 0 (paths): %v", err)
 	}
 
-	valueFiles, ok := AsStringOrStringList(valueFilesV)
+	valueFiles, ok := value.AsStringOrStringList(valueFilesV)
 	if !ok {
 		return nil, fmt.Errorf("Argument 'values' must be string or list of strings. Actual: %T",
 			valueFilesV)
+	}
+
+	set, ok := value.AsStringOrStringList(setV)
+	if !ok {
+		return nil, fmt.Errorf("Argument 'set' must be string or list of strings. Actual: %T", setV)
 	}
 
 	info, err := os.Stat(localPath)
@@ -289,221 +158,98 @@ func (s *tiltfileState) helm(thread *starlark.Thread, fn *starlark.Builtin, args
 		return nil, fmt.Errorf("helm() may only be called on directories with Chart.yaml: %q", localPath)
 	}
 
-	cmd := []string{"helm", "template", localPath}
-	if name != "" {
-		cmd = append(cmd, "--name", name)
+	deps, err := localSubchartDependenciesFromPath(localPath)
+	if err != nil {
+		return nil, err
 	}
+	for _, d := range deps {
+		err = tiltfile_io.RecordReadFile(thread, starkit.AbsPath(thread, d))
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	version, err := getHelmVersion()
+	if err != nil {
+		return nil, err
+	}
+
+	var cmd []string
+
+	if version == helmV3 {
+		if name != "" {
+			cmd = []string{"helm", "template", name, localPath}
+		} else {
+			cmd = []string{"helm", "template", localPath, "--generate-name"}
+		}
+	} else {
+		cmd = []string{"helm", "template", localPath}
+		if name != "" {
+			cmd = append(cmd, "--name", name)
+		}
+	}
+
 	if namespace != "" {
 		cmd = append(cmd, "--namespace", namespace)
 	}
 	for _, valueFile := range valueFiles {
 		cmd = append(cmd, "--values", valueFile)
-		s.recordConfigFile(s.absPath(thread, valueFile))
+		err := tiltfile_io.RecordReadFile(thread, starkit.AbsPath(thread, valueFile))
+		if err != nil {
+			return nil, err
+		}
 	}
+	for _, setArg := range set {
+		cmd = append(cmd, "--set", setArg)
+	}
+
+	s.logger.Infof("Running: %s", cmd)
 
 	stdout, err := s.execLocalCmd(thread, exec.Command(cmd[0], cmd[1:]...), false)
 	if err != nil {
 		return nil, err
 	}
 
-	s.recordConfigFile(localPath)
+	err = tiltfile_io.RecordReadFile(thread, localPath)
+	if err != nil {
+		return nil, err
+	}
 
 	yaml := filterHelmTestYAML(string(stdout))
 
 	if namespace != "" {
-		// helm template --namespace doesn't inject the namespace,
-		// so we have to do that ourselves :\
+		// helm template --namespace doesn't inject the namespace, nor provide
+		// YAML that defines the namespace, so we have to do both ourselves :\
 		// https://github.com/helm/helm/issues/5465
-		entities, err := k8s.ParseYAMLFromString(yaml)
+		parsed, err := k8s.ParseYAMLFromString(yaml)
 		if err != nil {
 			return nil, err
 		}
 
-		for i, e := range entities {
-			entities[i] = e.WithNamespace(namespace)
+		var haveYAMLForNamespace bool
+		for i, e := range parsed {
+			if e.GVK().Kind == "Namespace" && e.Name() == namespace {
+				// Chart already has YAML for the --namespace passed, we don't need to insert it
+				haveYAMLForNamespace = true
+				continue
+			}
+			parsed[i] = e.WithNamespace(namespace)
 		}
+
+		var entities []k8s.K8sEntity
+		if !haveYAMLForNamespace {
+			// User is relying on Helm to create the namespace, which it does independent
+			// of the YAML it generates, so we need to make sure the new namespace is included
+			// in the YAML.
+			entities = []k8s.K8sEntity{k8s.NewNamespaceEntity(namespace)}
+		}
+		entities = append(entities, parsed...)
+
 		yaml, err = k8s.SerializeSpecYAML(entities)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	return newBlob(yaml, fmt.Sprintf("helm: %s", localPath)), nil
-}
-
-func (s *tiltfileState) blob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var input starlark.String
-	err := s.unpackArgs(fn.Name(), args, kwargs, "input", &input)
-	if err != nil {
-		return nil, err
-	}
-
-	return newBlob(input.GoString(), "Tiltfile blob() call"), nil
-}
-
-func (s *tiltfileState) listdir(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var dir starlark.String
-	var recursive bool
-	err := s.unpackArgs(fn.Name(), args, kwargs, "dir", &dir, "recursive?", &recursive)
-	if err != nil {
-		return nil, err
-	}
-
-	localPath, err := s.absPathFromStarlarkValue(thread, dir)
-	if err != nil {
-		return nil, fmt.Errorf("Argument 0 (paths): %v", err)
-	}
-	s.recordConfigFile(localPath)
-	var files []string
-	err = filepath.Walk(localPath, func(path string, info os.FileInfo, err error) error {
-		if path == localPath {
-			return nil
-		}
-		if !info.IsDir() {
-			files = append(files, path)
-		} else if info.IsDir() && !recursive {
-			return filepath.SkipDir
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	var ret []starlark.Value
-	for _, f := range files {
-		ret = append(ret, starlark.String(f))
-	}
-
-	return starlark.NewList(ret), nil
-}
-
-func (s *tiltfileState) readYaml(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var path starlark.String
-	var defaultValue starlark.Value
-	if err := s.unpackArgs(fn.Name(), args, kwargs, "paths", &path, "default?", &defaultValue); err != nil {
-		return nil, err
-	}
-
-	localPath, err := s.absPathFromStarlarkValue(thread, path)
-	if err != nil {
-		return nil, fmt.Errorf("Argument 0 (paths): %v", err)
-	}
-
-	contents, err := s.readFile(localPath)
-	if err != nil {
-		// Return the default value if the file doesn't exist AND a default value was given
-		if os.IsNotExist(err) && defaultValue != nil {
-			return defaultValue, nil
-		}
-		return nil, err
-	}
-
-	var decodedYAML interface{}
-	err = yaml.Unmarshal(contents, &decodedYAML)
-	if err != nil {
-		return nil, fmt.Errorf("error parsing YAML: %v in %s", err, path.GoString())
-	}
-
-	v, err := convertStructuredDataToStarlark(decodedYAML)
-	if err != nil {
-		return nil, fmt.Errorf("error converting YAML to Starlark: %v in %s", err, path.GoString())
-	}
-	return v, nil
-}
-
-func (s *tiltfileState) decodeJSON(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var jsonString starlark.String
-	if err := s.unpackArgs(fn.Name(), args, kwargs, "json", &jsonString); err != nil {
-		return nil, err
-	}
-
-	var decodedJSON interface{}
-
-	if err := json.Unmarshal([]byte(jsonString), &decodedJSON); err != nil {
-		return nil, fmt.Errorf("JSON parsing error: %v in %s", err, jsonString.GoString())
-	}
-
-	v, err := convertStructuredDataToStarlark(decodedJSON)
-	if err != nil {
-		return nil, fmt.Errorf("error converting JSON to Starlark: %v in %s", err, jsonString.GoString())
-	}
-	return v, nil
-}
-
-func (s *tiltfileState) readJson(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var path starlark.String
-	var defaultValue starlark.Value
-	if err := s.unpackArgs(fn.Name(), args, kwargs, "paths", &path, "default?", &defaultValue); err != nil {
-		return nil, err
-	}
-
-	localPath, err := s.absPathFromStarlarkValue(thread, path)
-	if err != nil {
-		return nil, fmt.Errorf("Argument 0 (paths): %v", err)
-	}
-
-	contents, err := s.readFile(localPath)
-	if err != nil {
-		// Return the default value if the file doesn't exist AND a default value was given
-		if os.IsNotExist(err) && defaultValue != nil {
-			return defaultValue, nil
-		}
-		return nil, err
-	}
-
-	var decodedJSON interface{}
-
-	if err := json.Unmarshal(contents, &decodedJSON); err != nil {
-		return nil, fmt.Errorf("JSON parsing error: %v in %s", err, path.GoString())
-	}
-
-	v, err := convertStructuredDataToStarlark(decodedJSON)
-	if err != nil {
-		return nil, fmt.Errorf("error converting JSON to Starlark: %v in %s", err, path.GoString())
-	}
-	return v, nil
-}
-
-func convertStructuredDataToStarlark(j interface{}) (starlark.Value, error) {
-	switch j := j.(type) {
-	case bool:
-		return starlark.Bool(j), nil
-	case string:
-		return starlark.String(j), nil
-	case float64:
-		return starlark.Float(j), nil
-	case []interface{}:
-		listOfValues := []starlark.Value{}
-
-		for _, v := range j {
-			convertedValue, err := convertStructuredDataToStarlark(v)
-			if err != nil {
-				return nil, err
-			}
-			listOfValues = append(listOfValues, convertedValue)
-		}
-
-		return starlark.NewList(listOfValues), nil
-	case map[string]interface{}:
-		mapOfValues := &starlark.Dict{}
-
-		for k, v := range j {
-			convertedValue, err := convertStructuredDataToStarlark(v)
-			if err != nil {
-				return nil, err
-			}
-
-			err = mapOfValues.SetKey(starlark.String(k), convertedValue)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		return mapOfValues, nil
-	case nil:
-		return starlark.None, nil
-	}
-
-	return nil, errors.New(fmt.Sprintf("Unable to convert json to starlark value, unexpected type %T", j))
+	return tiltfile_io.NewBlob(yaml, fmt.Sprintf("helm: %s", localPath)), nil
 }

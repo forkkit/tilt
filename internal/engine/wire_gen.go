@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/wire"
 	"github.com/windmilleng/wmclient/pkg/dirs"
+	"go.opentelemetry.io/otel/sdk/trace"
 
 	"github.com/windmilleng/tilt/internal/analytics"
 	"github.com/windmilleng/tilt/internal/build"
@@ -17,16 +18,17 @@ import (
 	"github.com/windmilleng/tilt/internal/docker"
 	"github.com/windmilleng/tilt/internal/dockercompose"
 	"github.com/windmilleng/tilt/internal/dockerfile"
+	"github.com/windmilleng/tilt/internal/engine/buildcontrol"
 	"github.com/windmilleng/tilt/internal/k8s"
 	"github.com/windmilleng/tilt/internal/minikube"
 	"github.com/windmilleng/tilt/internal/synclet"
 	"github.com/windmilleng/tilt/internal/synclet/sidecar"
-	"github.com/windmilleng/tilt/pkg/logger"
+	"github.com/windmilleng/tilt/internal/tracer"
 )
 
 // Injectors from wire.go:
 
-func provideBuildAndDeployer(ctx context.Context, docker2 docker.Client, kClient k8s.Client, dir *dirs.WindmillDir, env k8s.Env, updateMode UpdateModeFlag, sCli *synclet.TestSyncletClient, dcc dockercompose.DockerComposeClient, clock build.Clock, kp KINDPusher, analytics2 *analytics.TiltAnalytics) (BuildAndDeployer, error) {
+func provideBuildAndDeployer(ctx context.Context, docker2 docker.Client, kClient k8s.Client, dir *dirs.WindmillDir, env k8s.Env, updateMode buildcontrol.UpdateModeFlag, sCli *synclet.TestSyncletClient, dcc dockercompose.DockerComposeClient, clock build.Clock, kp KINDLoader, analytics2 *analytics.TiltAnalytics) (BuildAndDeployer, error) {
 	dockerContainerUpdater := containerupdate.NewDockerContainerUpdater(docker2)
 	syncletClient, err := synclet.FakeGRPCWrapper(ctx, sCli)
 	if err != nil {
@@ -36,43 +38,47 @@ func provideBuildAndDeployer(ctx context.Context, docker2 docker.Client, kClient
 	syncletUpdater := containerupdate.NewSyncletUpdater(syncletManager)
 	execUpdater := containerupdate.NewExecUpdater(kClient)
 	runtime := k8s.ProvideContainerRuntime(ctx, kClient)
-	engineUpdateMode, err := ProvideUpdateMode(updateMode, env, runtime)
+	buildcontrolUpdateMode, err := buildcontrol.ProvideUpdateMode(updateMode, env, runtime)
 	if err != nil {
 		return nil, err
 	}
-	liveUpdateBuildAndDeployer := NewLiveUpdateBuildAndDeployer(dockerContainerUpdater, syncletUpdater, execUpdater, engineUpdateMode, env, runtime)
+	liveUpdateBuildAndDeployer := NewLiveUpdateBuildAndDeployer(dockerContainerUpdater, syncletUpdater, execUpdater, buildcontrolUpdateMode, env, runtime, clock)
 	labels := _wireLabelsValue
 	dockerImageBuilder := build.NewDockerImageBuilder(docker2, labels)
 	imageBuilder := build.DefaultImageBuilder(dockerImageBuilder)
-	cacheBuilder := build.NewCacheBuilder(docker2)
 	execCustomBuilder := build.NewExecCustomBuilder(docker2, clock)
 	syncletImageRef, err := sidecar.ProvideSyncletImageRef(ctx)
 	if err != nil {
 		return nil, err
 	}
 	syncletContainer := sidecar.ProvideSyncletContainer(syncletImageRef)
-	imageBuildAndDeployer := NewImageBuildAndDeployer(imageBuilder, cacheBuilder, execCustomBuilder, kClient, env, analytics2, engineUpdateMode, clock, runtime, kp, syncletContainer)
-	engineImageAndCacheBuilder := NewImageAndCacheBuilder(imageBuilder, cacheBuilder, execCustomBuilder, engineUpdateMode)
+	imageBuildAndDeployer := NewImageBuildAndDeployer(imageBuilder, execCustomBuilder, kClient, env, analytics2, buildcontrolUpdateMode, clock, runtime, kp, syncletContainer)
+	engineImageAndCacheBuilder := NewImageAndCacheBuilder(imageBuilder, execCustomBuilder, buildcontrolUpdateMode)
 	dockerComposeBuildAndDeployer := NewDockerComposeBuildAndDeployer(dcc, docker2, engineImageAndCacheBuilder, clock)
 	localTargetBuildAndDeployer := NewLocalTargetBuildAndDeployer(clock)
-	buildOrder := DefaultBuildOrder(liveUpdateBuildAndDeployer, imageBuildAndDeployer, dockerComposeBuildAndDeployer, localTargetBuildAndDeployer, engineUpdateMode, env, runtime)
-	compositeBuildAndDeployer := NewCompositeBuildAndDeployer(buildOrder)
+	buildOrder := DefaultBuildOrder(liveUpdateBuildAndDeployer, imageBuildAndDeployer, dockerComposeBuildAndDeployer, localTargetBuildAndDeployer, buildcontrolUpdateMode, env, runtime)
+	spanProcessor := _wireSpanProcessorValue
+	traceTracer, err := tracer.InitOpenTelemetry(ctx, spanProcessor)
+	if err != nil {
+		return nil, err
+	}
+	compositeBuildAndDeployer := NewCompositeBuildAndDeployer(buildOrder, traceTracer)
 	return compositeBuildAndDeployer, nil
 }
 
 var (
-	_wireLabelsValue = dockerfile.Labels{}
+	_wireLabelsValue        = dockerfile.Labels{}
+	_wireSpanProcessorValue = (trace.SpanProcessor)(nil)
 )
 
-func provideImageBuildAndDeployer(ctx context.Context, docker2 docker.Client, kClient k8s.Client, env k8s.Env, dir *dirs.WindmillDir, clock build.Clock, kp KINDPusher, analytics2 *analytics.TiltAnalytics) (*ImageBuildAndDeployer, error) {
+func provideImageBuildAndDeployer(ctx context.Context, docker2 docker.Client, kClient k8s.Client, env k8s.Env, dir *dirs.WindmillDir, clock build.Clock, kp KINDLoader, analytics2 *analytics.TiltAnalytics) (*ImageBuildAndDeployer, error) {
 	labels := _wireLabelsValue
 	dockerImageBuilder := build.NewDockerImageBuilder(docker2, labels)
 	imageBuilder := build.DefaultImageBuilder(dockerImageBuilder)
-	cacheBuilder := build.NewCacheBuilder(docker2)
 	execCustomBuilder := build.NewExecCustomBuilder(docker2, clock)
 	updateModeFlag := _wireUpdateModeFlagValue
 	runtime := k8s.ProvideContainerRuntime(ctx, kClient)
-	updateMode, err := ProvideUpdateMode(updateModeFlag, env, runtime)
+	updateMode, err := buildcontrol.ProvideUpdateMode(updateModeFlag, env, runtime)
 	if err != nil {
 		return nil, err
 	}
@@ -81,22 +87,21 @@ func provideImageBuildAndDeployer(ctx context.Context, docker2 docker.Client, kC
 		return nil, err
 	}
 	syncletContainer := sidecar.ProvideSyncletContainer(syncletImageRef)
-	imageBuildAndDeployer := NewImageBuildAndDeployer(imageBuilder, cacheBuilder, execCustomBuilder, kClient, env, analytics2, updateMode, clock, runtime, kp, syncletContainer)
+	imageBuildAndDeployer := NewImageBuildAndDeployer(imageBuilder, execCustomBuilder, kClient, env, analytics2, updateMode, clock, runtime, kp, syncletContainer)
 	return imageBuildAndDeployer, nil
 }
 
 var (
-	_wireUpdateModeFlagValue = UpdateModeFlag(UpdateModeAuto)
+	_wireUpdateModeFlagValue = buildcontrol.UpdateModeFlag(buildcontrol.UpdateModeAuto)
 )
 
 func provideDockerComposeBuildAndDeployer(ctx context.Context, dcCli dockercompose.DockerComposeClient, dCli docker.Client, dir *dirs.WindmillDir) (*DockerComposeBuildAndDeployer, error) {
 	labels := _wireLabelsValue
 	dockerImageBuilder := build.NewDockerImageBuilder(dCli, labels)
 	imageBuilder := build.DefaultImageBuilder(dockerImageBuilder)
-	cacheBuilder := build.NewCacheBuilder(dCli)
 	clock := build.ProvideClock()
 	execCustomBuilder := build.NewExecCustomBuilder(dCli, clock)
-	updateModeFlag := _wireEngineUpdateModeFlagValue
+	updateModeFlag := _wireBuildcontrolUpdateModeFlagValue
 	env := _wireEnvValue
 	clientConfig := k8s.ProvideClientConfig()
 	restConfigOrError := k8s.ProvideRESTConfig(clientConfig)
@@ -115,32 +120,31 @@ func provideDockerComposeBuildAndDeployer(ctx context.Context, dcCli dockercompo
 	kubectlRunner := k8s.ProvideKubectlRunner(kubeContext, int2)
 	client := k8s.ProvideK8sClient(ctx, env, restConfigOrError, clientsetOrError, portForwardClient, namespace, kubectlRunner, clientConfig)
 	runtime := k8s.ProvideContainerRuntime(ctx, client)
-	updateMode, err := ProvideUpdateMode(updateModeFlag, env, runtime)
+	updateMode, err := buildcontrol.ProvideUpdateMode(updateModeFlag, env, runtime)
 	if err != nil {
 		return nil, err
 	}
-	engineImageAndCacheBuilder := NewImageAndCacheBuilder(imageBuilder, cacheBuilder, execCustomBuilder, updateMode)
+	engineImageAndCacheBuilder := NewImageAndCacheBuilder(imageBuilder, execCustomBuilder, updateMode)
 	dockerComposeBuildAndDeployer := NewDockerComposeBuildAndDeployer(dcCli, dCli, engineImageAndCacheBuilder, clock)
 	return dockerComposeBuildAndDeployer, nil
 }
 
 var (
-	_wireEngineUpdateModeFlagValue = UpdateModeFlag(UpdateModeAuto)
-	_wireEnvValue                  = k8s.Env(k8s.EnvNone)
+	_wireBuildcontrolUpdateModeFlagValue = buildcontrol.UpdateModeFlag(buildcontrol.UpdateModeAuto)
+	_wireEnvValue                        = k8s.Env(k8s.EnvNone)
 )
 
 // wire.go:
 
-var DeployerBaseWireSet = wire.NewSet(wire.Value(dockerfile.Labels{}), wire.Value(UpperReducer), sidecar.WireSet, minikube.ProvideMinikubeClient, build.DefaultImageBuilder, build.NewCacheBuilder, build.NewDockerImageBuilder, build.NewExecCustomBuilder, wire.Bind(new(build.CustomBuilder), new(build.ExecCustomBuilder)), NewLocalTargetBuildAndDeployer,
+var DeployerBaseWireSet = wire.NewSet(wire.Value(dockerfile.Labels{}), wire.Value(UpperReducer), sidecar.WireSet, minikube.ProvideMinikubeClient, build.DefaultImageBuilder, build.NewDockerImageBuilder, build.NewExecCustomBuilder, wire.Bind(new(build.CustomBuilder), new(*build.ExecCustomBuilder)), NewLocalTargetBuildAndDeployer,
 	NewImageBuildAndDeployer, containerupdate.NewDockerContainerUpdater, containerupdate.NewSyncletUpdater, containerupdate.NewExecUpdater, NewLiveUpdateBuildAndDeployer,
 	NewDockerComposeBuildAndDeployer,
 	NewImageAndCacheBuilder,
-	DefaultBuildOrder, wire.Bind(new(BuildAndDeployer), new(CompositeBuildAndDeployer)), NewCompositeBuildAndDeployer,
-	ProvideUpdateMode,
+	DefaultBuildOrder, tracer.InitOpenTelemetry, wire.Bind(new(BuildAndDeployer), new(*CompositeBuildAndDeployer)), NewCompositeBuildAndDeployer, buildcontrol.ProvideUpdateMode,
 )
 
 var DeployerWireSetTest = wire.NewSet(
-	DeployerBaseWireSet, containerupdate.NewSyncletManagerForTests, synclet.FakeGRPCWrapper,
+	DeployerBaseWireSet, containerupdate.NewSyncletManagerForTests, wire.InterfaceValue(new(trace.SpanProcessor), (trace.SpanProcessor)(nil)), synclet.FakeGRPCWrapper,
 )
 
 var DeployerWireSet = wire.NewSet(
@@ -148,5 +152,5 @@ var DeployerWireSet = wire.NewSet(
 )
 
 func provideKubectlLogLevelInfo() k8s.KubectlLogLevel {
-	return k8s.KubectlLogLevel(logger.InfoLvl)
+	return k8s.KubectlLogLevel(0)
 }

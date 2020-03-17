@@ -11,7 +11,7 @@ import (
 	"github.com/docker/distribution/manifest/schema2"
 	"github.com/docker/distribution/reference"
 	"github.com/docker/distribution/registry/api/errcode"
-	"github.com/docker/distribution/registry/api/v2"
+	v2 "github.com/docker/distribution/registry/api/v2"
 	distclient "github.com/docker/distribution/registry/client"
 	"github.com/docker/docker/registry"
 	digest "github.com/opencontainers/go-digest"
@@ -103,9 +103,6 @@ func pullManifestSchemaV2ImageConfig(ctx context.Context, dgst digest.Digest, re
 	}
 
 	verifier := dgst.Verifier()
-	if err != nil {
-		return nil, err
-	}
 	if _, err := verifier.Write(configJSON); err != nil {
 		return nil, err
 	}
@@ -200,7 +197,7 @@ func continueOnError(err error) bool {
 }
 
 func (c *client) iterateEndpoints(ctx context.Context, namedRef reference.Named, each func(context.Context, distribution.Repository, reference.Named) (bool, error)) error {
-	endpoints, err := allEndpoints(namedRef)
+	endpoints, err := allEndpoints(namedRef, c.insecureRegistry)
 	if err != nil {
 		return err
 	}
@@ -212,7 +209,6 @@ func (c *client) iterateEndpoints(ctx context.Context, namedRef reference.Named,
 
 	confirmedTLSRegistries := make(map[string]bool)
 	for _, endpoint := range endpoints {
-
 		if endpoint.Version == registry.APIVersion1 {
 			logrus.Debugf("skipping v1 endpoint %s", endpoint.URL)
 			continue
@@ -231,7 +227,7 @@ func (c *client) iterateEndpoints(ctx context.Context, namedRef reference.Named,
 		repoEndpoint := repositoryEndpoint{endpoint: endpoint, info: repoInfo}
 		repo, err := c.getRepositoryForReference(ctx, namedRef, repoEndpoint)
 		if err != nil {
-			logrus.Debugf("error with repo endpoint %s: %s", repoEndpoint, err)
+			logrus.Debugf("error %s with repo endpoint %+v", err, repoEndpoint)
 			if _, ok := err.(ErrHTTPProto); ok {
 				continue
 			}
@@ -262,12 +258,18 @@ func (c *client) iterateEndpoints(ctx context.Context, namedRef reference.Named,
 }
 
 // allEndpoints returns a list of endpoints ordered by priority (v2, https, v1).
-func allEndpoints(namedRef reference.Named) ([]registry.APIEndpoint, error) {
+func allEndpoints(namedRef reference.Named, insecure bool) ([]registry.APIEndpoint, error) {
 	repoInfo, err := registry.ParseRepositoryInfo(namedRef)
 	if err != nil {
 		return nil, err
 	}
-	registryService, err := registry.NewService(registry.ServiceOptions{})
+
+	var serviceOpts registry.ServiceOptions
+	if insecure {
+		logrus.Debugf("allowing insecure registry for: %s", reference.Domain(namedRef))
+		serviceOpts.InsecureRegistries = []string{reference.Domain(namedRef)}
+	}
+	registryService, err := registry.NewService(serviceOpts)
 	if err != nil {
 		return []registry.APIEndpoint{}, err
 	}

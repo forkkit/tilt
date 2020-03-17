@@ -74,12 +74,7 @@ func TestDirTrailingSlash(t *testing.T) {
 func TestTryAsCwdChildren(t *testing.T) {
 	f := NewOspathFixture(t)
 	defer f.TearDown()
-	oldPWD, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Chdir(oldPWD)
-	os.Chdir(f.Path())
+	f.Chdir()
 
 	results := TryAsCwdChildren([]string{f.Path()})
 

@@ -35,7 +35,7 @@ exports[`renders multiple lines of a crash log 1`] = `
             dateTime="1949-11-18T09:39:00.000Z"
             title="1,555,970,585,039"
           >
-            67yr
+            67yr ago
           </time>
         </div>
       </header>
@@ -46,6 +46,7 @@ exports[`renders multiple lines of a crash log 1`] = `
             style={null}
           >
             Eeeeek the container crashed
+
           </span>
         </code>
         <code>
@@ -54,6 +55,7 @@ exports[`renders multiple lines of a crash log 1`] = `
             style={null}
           >
             no but really it crashed
+
           </span>
         </code>
       </section>
@@ -115,7 +117,7 @@ exports[`renders one container start error 1`] = `
             dateTime="1949-11-18T09:39:00.000Z"
             title="1,555,970,585,039"
           >
-            67yr
+            67yr ago
           </time>
         </div>
       </header>
@@ -126,6 +128,7 @@ exports[`renders one container start error 1`] = `
             style={null}
           >
             Eeeeek there is a problem
+
           </span>
         </code>
       </section>
@@ -170,7 +173,7 @@ exports[`renders one container start error 2`] = `
             dateTime="1949-11-18T09:39:00.000Z"
             title="1,555,970,585,039"
           >
-            67yr
+            67yr ago
           </time>
         </div>
       </header>
@@ -181,6 +184,7 @@ exports[`renders one container start error 2`] = `
             style={null}
           >
             Eeeeek there is a problem
+
           </span>
         </code>
       </section>
@@ -225,7 +229,7 @@ exports[`renders one container unrecognized error 1`] = `
             dateTime="2016-12-21T23:36:07.071Z"
             title="2016-12-21 23:36"
           >
-            &lt;5s
+            &lt;5s ago
           </time>
         </div>
       </header>
@@ -236,6 +240,7 @@ exports[`renders one container unrecognized error 1`] = `
             style={null}
           >
             Detailed message on GarbleError
+
           </span>
         </code>
       </section>
@@ -280,7 +285,7 @@ exports[`renders warnings 1`] = `
             dateTime="1949-11-18T09:39:00.000Z"
             title="1,555,970,585,039"
           >
-            67yr
+            67yr ago
           </time>
         </div>
       </header>
@@ -291,6 +296,7 @@ exports[`renders warnings 1`] = `
             style={null}
           >
             Eeeeek the container crashed
+
           </span>
         </code>
       </section>
@@ -326,7 +332,7 @@ exports[`renders warnings 1`] = `
             dateTime="1949-11-18T09:39:00.000Z"
             title="1,555,970,585,039"
           >
-            67yr
+            67yr ago
           </time>
         </div>
       </header>
@@ -337,6 +343,7 @@ exports[`renders warnings 1`] = `
             style={null}
           >
             Hi I'm a warning
+
           </span>
         </code>
       </section>
@@ -381,7 +388,7 @@ exports[`shows that a container has restarted 1`] = `
             dateTime="1949-11-18T09:39:00.000Z"
             title="1,555,970,585,039"
           >
-            67yr
+            67yr ago
           </time>
         </div>
       </header>
@@ -392,6 +399,7 @@ exports[`shows that a container has restarted 1`] = `
             style={null}
           >
             Eeeeek the container crashed
+
           </span>
         </code>
       </section>
@@ -441,7 +449,7 @@ exports[`shows that a crash rebuild has occurred 1`] = `
             dateTime="1949-11-18T09:39:00.000Z"
             title="1,555,970,585,039"
           >
-            67yr
+            67yr ago
           </time>
         </div>
       </header>
@@ -452,6 +460,7 @@ exports[`shows that a crash rebuild has occurred 1`] = `
             style={null}
           >
             Eeeeek the container crashed
+
           </span>
         </code>
       </section>

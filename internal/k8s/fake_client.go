@@ -60,8 +60,9 @@ type FakeK8sClient struct {
 	UpsertError      error
 	LastUpsertResult []K8sEntity
 
-	Runtime  container.Runtime
-	Registry container.Registry
+	Runtime    container.Runtime
+	Registry   container.Registry
+	FakeNodeIP NodeIP
 
 	entityByName            map[string]K8sEntity
 	getByReferenceCallCount int
@@ -85,7 +86,7 @@ type fakeServiceWatch struct {
 
 type fakePodWatch struct {
 	ls labels.Selector
-	ch chan *v1.Pod
+	ch chan ObjectUpdate
 }
 
 func (c *FakeK8sClient) EmitService(ls labels.Selector, s *v1.Service) {
@@ -149,14 +150,24 @@ func (c *FakeK8sClient) EmitPod(ls labels.Selector, p *v1.Pod) {
 	defer c.podWatcherMu.Unlock()
 	for _, w := range c.podWatches {
 		if SelectorEqual(ls, w.ls) {
-			w.ch <- p
+			w.ch <- ObjectUpdate{obj: p}
 		}
 	}
 }
 
-func (c *FakeK8sClient) WatchPods(ctx context.Context, ls labels.Selector) (<-chan *v1.Pod, error) {
+func (c *FakeK8sClient) EmitPodDelete(ls labels.Selector, p *v1.Pod) {
 	c.podWatcherMu.Lock()
-	ch := make(chan *v1.Pod, 20)
+	defer c.podWatcherMu.Unlock()
+	for _, w := range c.podWatches {
+		if SelectorEqual(ls, w.ls) {
+			w.ch <- ObjectUpdate{obj: p, isDelete: true}
+		}
+	}
+}
+
+func (c *FakeK8sClient) WatchPods(ctx context.Context, ls labels.Selector) (<-chan ObjectUpdate, error) {
+	c.podWatcherMu.Lock()
+	ch := make(chan ObjectUpdate, 20)
 	c.podWatches = append(c.podWatches, fakePodWatch{ls, ch})
 	c.podWatcherMu.Unlock()
 
@@ -323,9 +334,9 @@ func (c *FakeK8sClient) applyWasCalled() bool {
 	return c.Yaml != ""
 }
 
-func (c *FakeK8sClient) CreatePortForwarder(ctx context.Context, namespace Namespace, podID PodID, optionalLocalPort, remotePort int) (PortForwarder, error) {
+func (c *FakeK8sClient) CreatePortForwarder(ctx context.Context, namespace Namespace, podID PodID, optionalLocalPort, remotePort int, host string) (PortForwarder, error) {
 	pfc := &(c.FakePortForwardClient)
-	return pfc.CreatePortForwarder(ctx, namespace, podID, optionalLocalPort, remotePort)
+	return pfc.CreatePortForwarder(ctx, namespace, podID, optionalLocalPort, remotePort, host)
 }
 
 func (c *FakeK8sClient) ContainerRuntime(ctx context.Context) container.Runtime {
@@ -335,8 +346,12 @@ func (c *FakeK8sClient) ContainerRuntime(ctx context.Context) container.Runtime 
 	return container.RuntimeDocker
 }
 
-func (c *FakeK8sClient) PrivateRegistry(ctx context.Context) container.Registry {
+func (c *FakeK8sClient) LocalRegistry(ctx context.Context) container.Registry {
 	return c.Registry
+}
+
+func (c *FakeK8sClient) NodeIP(ctx context.Context) NodeIP {
+	return c.FakeNodeIP
 }
 
 func (c *FakeK8sClient) Exec(ctx context.Context, podID PodID, cName container.Name, n Namespace, cmd []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) error {
@@ -398,15 +413,17 @@ type FakePortForwardClient struct {
 	CreatePortForwardCallCount int
 	LastForwardPortPodID       PodID
 	LastForwardPortRemotePort  int
+	LastForwardPortHost        string
 	LastForwarder              FakePortForwarder
 	LastForwardContext         context.Context
 }
 
-func (c *FakePortForwardClient) CreatePortForwarder(ctx context.Context, namespace Namespace, podID PodID, optionalLocalPort, remotePort int) (PortForwarder, error) {
+func (c *FakePortForwardClient) CreatePortForwarder(ctx context.Context, namespace Namespace, podID PodID, optionalLocalPort, remotePort int, host string) (PortForwarder, error) {
 	c.CreatePortForwardCallCount++
 	c.LastForwardContext = ctx
 	c.LastForwardPortPodID = podID
 	c.LastForwardPortRemotePort = remotePort
+	c.LastForwardPortHost = host
 
 	result := FakePortForwarder{
 		localPort: optionalLocalPort,

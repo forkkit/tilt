@@ -1,5 +1,5 @@
-FROM golang:1.11-alpine
-WORKDIR /go/src/github.com/windmilleng/tilt/integration/onewatch
+FROM busybox
+WORKDIR /app
 ADD . .
-RUN go install github.com/windmilleng/tilt/integration/onewatch
-ENTRYPOINT ./start.sh /go/bin/onewatch
+RUN ./compile.sh
+ENTRYPOINT ./start.sh ./main.sh

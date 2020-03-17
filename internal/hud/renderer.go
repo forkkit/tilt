@@ -15,57 +15,57 @@ import (
 	"github.com/windmilleng/tilt/pkg/model"
 )
 
+const defaultLogPaneHeight = 8
+
 type Renderer struct {
 	rty    rty.RTY
 	screen tcell.Screen
-	mu     *sync.Mutex
+	mu     *sync.RWMutex
 	clock  func() time.Time
 }
 
 func NewRenderer(clock func() time.Time) *Renderer {
 	return &Renderer{
-		mu:    new(sync.Mutex),
+		mu:    new(sync.RWMutex),
 		clock: clock,
 	}
 }
 
-func (r *Renderer) Render(v view.View, vs view.ViewState) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.rty != nil {
+func (r *Renderer) Render(v view.View, vs view.ViewState) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rty := r.rty
+	if rty != nil {
 		layout := r.layout(v, vs)
-		err := r.rty.Render(layout)
-		if err != nil {
-			return err
-		}
+		rty.Render(layout)
 	}
-	return nil
 }
 
 var cText = tcell.Color232
 var cLightText = tcell.Color243
 var cGood = tcell.ColorGreen
 var cBad = tcell.ColorRed
-var cPending = tcell.ColorYellow
+var cPending = tcell.Color243
 
 var statusColors = map[string]tcell.Color{
-	"Running":                          cGood,
-	"ContainerCreating":                cPending,
-	"Pending":                          cPending,
-	"PodInitializing":                  cPending,
-	"Error":                            cBad,
-	"CrashLoopBackOff":                 cBad,
-	"ErrImagePull":                     cBad,
-	"ImagePullBackOff":                 cBad,
-	"RunContainerError":                cBad,
-	"StartError":                       cBad,
-	string(dockercompose.StatusInProg): cPending,
-	string(dockercompose.StatusUp):     cGood,
-	string(dockercompose.StatusDown):   cBad,
-	"Completed":                        cGood,
-
-	// Placeholder. LocalResource has no runtime status; if build succeeds, should always be green
-	view.LocalResourceStatusPlaceholder: cGood,
+	"Running":                                cGood,
+	string(model.RuntimeStatusOK):            cGood,
+	string(model.RuntimeStatusNotApplicable): cGood,
+	"ContainerCreating":                      cPending,
+	"Pending":                                cPending,
+	"PodInitializing":                        cPending,
+	string(model.RuntimeStatusPending):       cPending,
+	"Error":                                  cBad,
+	"CrashLoopBackOff":                       cBad,
+	"ErrImagePull":                           cBad,
+	"ImagePullBackOff":                       cBad,
+	"RunContainerError":                      cBad,
+	"StartError":                             cBad,
+	string(model.RuntimeStatusError):         cBad,
+	string(dockercompose.StatusInProg):       cPending,
+	string(dockercompose.StatusUp):           cGood,
+	string(dockercompose.StatusDown):         cBad,
+	"Completed":                              cGood,
 }
 
 func (r *Renderer) layout(v view.View, vs view.ViewState) rty.Component {
@@ -133,7 +133,7 @@ func (r *Renderer) renderLogPane(v view.View, vs view.ViewState) rty.Component {
 	var height int
 	switch vs.TiltLogState {
 	case view.TiltLogShort:
-		height = 8
+		height = defaultLogPaneHeight
 	case view.TiltLogHalfScreen:
 		height = rty.GROW
 	case view.TiltLogFullScreen:
@@ -210,11 +210,7 @@ func keyLegend(v view.View, vs view.ViewState) string {
 }
 
 func isInError(res view.Resource) bool {
-	return statusColor(res) == cBad
-}
-
-func warnings(res view.Resource) []string {
-	return res.LastBuild().Warnings
+	return statusDisplayOptions(res).color == cBad
 }
 
 func isCrashing(res view.Resource) bool {
@@ -276,16 +272,13 @@ func (r *Renderer) renderResources(v view.View, vs view.ViewState) rty.Component
 
 	if len(rs) > 0 {
 		for i, res := range rs {
-			l.Add(r.renderResource(res, vs.Resources[i], res.TriggerMode, selectedResource == res.Name.String()))
+			resView := NewResourceView(v.LogReader, res, vs.Resources[i], res.TriggerMode, selectedResource == res.Name.String(), r.clock)
+			l.Add(resView.Build())
 		}
 	}
 
 	cl.Add(l)
 	return cl
-}
-
-func (r *Renderer) renderResource(res view.Resource, rv view.ResourceViewState, triggerMode model.TriggerMode, selected bool) rty.Component {
-	return NewResourceView(res, rv, triggerMode, selected, r.clock).Build()
 }
 
 func (r *Renderer) SetUp() (chan tcell.Event, error) {
@@ -316,11 +309,18 @@ func (r *Renderer) SetUp() (chan tcell.Event, error) {
 		}
 	}()
 
-	r.rty = rty.NewRTY(screen)
+	r.rty = rty.NewRTY(screen, rty.SkipErrorHandler{})
 
 	r.screen = screen
 
 	return screenEvents, nil
+}
+
+func (r *Renderer) RTY() rty.RTY {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	return r.rty
 }
 
 func (r *Renderer) Reset() {

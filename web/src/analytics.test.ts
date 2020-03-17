@@ -8,14 +8,6 @@ it("maps logs to logs", () => {
   expect(actual).toBe(expected)
 })
 
-it("maps previews to preview", () => {
-  let path = "/r/vigoda/preview"
-  let expected = "preview"
-
-  let actual = pathToTag(path)
-  expect(actual).toBe(expected)
-})
-
 it("maps / to all", () => {
   let path = "/"
   let expected = "all"
@@ -42,4 +34,8 @@ it("maps errors to errors", () => {
   path = "/r/foo/alerts"
   actual = pathToTag(path)
   expect(actual).toBe(expected)
+})
+
+it("maps trace", () => {
+  expect(pathToTag("/r/fe/trace/build:1")).toBe("trace")
 })

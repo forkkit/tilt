@@ -33,19 +33,33 @@ func OverwriteLabels(entity K8sEntity, labels []model.LabelPair) (K8sEntity, err
 	return injectLabels(entity, labels, true)
 }
 
+// labels: labels to be added to `dest`
+// overwrite: if true, merge `labels` into `dest`. if false, replace `dest` with `labels`
+// addNew: if true, add all `labels` to `dest`. if false, only add `labels` whose keys are already in `dest`
+func applyLabelsToMap(dest *map[string]string, labels []model.LabelPair, overwrite bool, addNew bool) {
+	orig := *dest
+	if overwrite {
+		*dest = nil
+	}
+	for _, label := range labels {
+		if *dest == nil {
+			*dest = make(map[string]string, 1)
+		}
+		preexisting := false
+		if orig != nil {
+			_, preexisting = orig[label.Key]
+		}
+
+		if addNew || preexisting {
+			(*dest)[label.Key] = label.Value
+		}
+	}
+}
+
 // injectLabels injects the given labels into the given k8sEntity
 // (if `overwrite`, replacing existing labels)
 func injectLabels(entity K8sEntity, labels []model.LabelPair, overwrite bool) (K8sEntity, error) {
 	entity = entity.DeepCopy()
-
-	switch obj := entity.Obj.(type) {
-	case *appsv1beta1.Deployment:
-		allowLabelChangesInAppsDeploymentBeta1(obj)
-	case *appsv1beta2.Deployment:
-		allowLabelChangesInAppsDeploymentBeta2(obj)
-	case *extv1beta1.Deployment:
-		allowLabelChangesInExtDeploymentBeta1(obj)
-	}
 
 	// Don't modify persistent volume claims
 	// because they're supposed to be immutable.
@@ -58,15 +72,35 @@ func injectLabels(entity K8sEntity, labels []model.LabelPair, overwrite bool) (K
 	}
 
 	for _, meta := range metas {
-		if overwrite {
-			meta.Labels = nil
-		}
-		for _, label := range labels {
-			if meta.Labels == nil {
-				meta.Labels = make(map[string]string, 1)
-			}
-			meta.Labels[label.Key] = label.Value
-		}
+		applyLabelsToMap(&meta.Labels, labels, overwrite, true)
+	}
+
+	switch obj := entity.Obj.(type) {
+	case *appsv1beta1.Deployment:
+		allowLabelChangesInAppsDeploymentBeta1(obj)
+	case *appsv1beta2.Deployment:
+		allowLabelChangesInAppsDeploymentBeta2(obj)
+	case *extv1beta1.Deployment:
+		allowLabelChangesInExtDeploymentBeta1(obj)
+	}
+
+	selectors, err := extractSelectors(&entity, func(v reflect.Value) bool {
+		return v.Type() != pvc
+	})
+	if err != nil {
+		return K8sEntity{}, err
+	}
+	for _, selector := range selectors {
+		applyLabelsToMap(&selector.MatchLabels, labels, overwrite, false)
+	}
+
+	// ServiceSpecs have a map[string]string instead of a LabelSelector, so handle them specially
+	serviceSpecs, err := extractServiceSpecs(&entity)
+	if err != nil {
+		return K8sEntity{}, err
+	}
+	for _, s := range serviceSpecs {
+		applyLabelsToMap(&s.Selector, labels, overwrite, false)
 	}
 	return entity, nil
 }

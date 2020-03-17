@@ -5,10 +5,12 @@ const nudgeTimeoutMs = 15000
 const nudgeElem = (): JSX.Element => {
   return (
     <p>
-      Welcome to Tilt! May we collect usage data to help us improve? (
+      Welcome to Tilt! We collect anonymized usage data to help us improve. Is
+      that OK? (
       <a
-        href="https://github.com/windmilleng/tilt#telemetry-and-privacy"
+        href="https://docs.tilt.dev/telemetry_faq.html"
         target="_blank"
+        rel="noopener noreferrer"
       >
         Read more
       </a>
@@ -37,7 +39,11 @@ const errorElem = (respBody: string): JSX.Element => {
   return (
     <p>
       Oh no, something went wrong! Request failed with: <pre>{respBody}</pre> (
-      <a href="https://tilt.dev/contact" target="_blank">
+      <a
+        href="https://tilt.dev/contact"
+        target="_blank"
+        rel="noopener noreferrer"
+      >
         contact us
       </a>
       )
@@ -98,7 +104,7 @@ class AnalyticsNudge extends Component<
         })
       })
 
-      if (response.status == 200) {
+      if (response.status === 200) {
         // if we successfully recorded the choice, dismiss the nudge after a few seconds
         setTimeout(() => {
           this.setState({ dismissed: true })
@@ -113,7 +119,7 @@ class AnalyticsNudge extends Component<
 
   messageElem(): JSX.Element {
     if (this.state.responseCode) {
-      if (this.state.responseCode == 200) {
+      if (this.state.responseCode === 200) {
         // Successfully called opt endpt.
         if (this.state.optIn) {
           // User opted in

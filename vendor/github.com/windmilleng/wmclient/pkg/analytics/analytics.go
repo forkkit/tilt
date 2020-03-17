@@ -12,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/denisbrodbeck/machineid"
 )
 
@@ -23,10 +22,10 @@ const statsTimeout = time.Minute
 
 // keys for request to stats server
 const (
-	keyDuration = "duration"
-	keyName     = "name"
-	keyUser     = "user"
-	keyMachine  = "machine"
+	TagDuration = "duration"
+	TagName     = "name"
+	TagUser     = "user"
+	TagMachine  = "machine"
 )
 
 var cli = &http.Client{Timeout: statsTimeout}
@@ -45,26 +44,16 @@ func (stdLogger) Printf(format string, v ...interface{}) {
 	log.Printf("[analytics] %s", fmt.Sprintf(format, v...))
 }
 
-func Init(appName string, options ...Option) (Analytics, *cobra.Command, error) {
-	a, err := NewRemoteAnalytics(appName, options...)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	c, err := initCLI()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return a, c, nil
-}
-
 type Analytics interface {
 	Count(name string, tags map[string]string, n int)
 	Incr(name string, tags map[string]string)
-	IncrAnonymous(name string, tags map[string]string)
 	Timer(name string, dur time.Duration, tags map[string]string)
 	Flush(timeout time.Duration)
+	GlobalTag(name string) (string, bool)
+
+	// Returns a new analytics that doesn't report any of the global tags.
+	// Useful for anonymous reporting.
+	WithoutGlobalTags() Analytics
 }
 
 type remoteAnalytics struct {
@@ -122,7 +111,7 @@ func NewRemoteAnalytics(appName string, options ...Option) (*remoteAnalytics, er
 		enabled:    enabled,
 		logger:     stdLogger{},
 		wg:         &sync.WaitGroup{},
-		globalTags: map[string]string{keyUser: getUserID(), keyMachine: getMachineID()},
+		globalTags: map[string]string{TagUser: getUserID(), TagMachine: getMachineID()},
 	}
 	for _, o := range options {
 		o(a)
@@ -134,12 +123,10 @@ func (a *remoteAnalytics) namespaced(name string) string {
 	return fmt.Sprintf("%s.%s", a.app, name)
 }
 
-func (a *remoteAnalytics) baseReqBody(name string, includeGlobalTags bool, tags map[string]string) map[string]interface{} {
-	req := map[string]interface{}{keyName: a.namespaced(name)}
-	if includeGlobalTags {
-		for k, v := range a.globalTags {
-			req[k] = v
-		}
+func (a *remoteAnalytics) baseReqBody(name string, tags map[string]string) map[string]interface{} {
+	req := map[string]interface{}{TagName: a.namespaced(name)}
+	for k, v := range a.globalTags {
+		req[k] = v
 	}
 	for k, v := range tags {
 		req[k] = v
@@ -163,19 +150,24 @@ func (a *remoteAnalytics) makeReq(reqBody map[string]interface{}) (*http.Request
 	return req, nil
 }
 
+func (a *remoteAnalytics) GlobalTag(name string) (string, bool) {
+	val, ok := a.globalTags[name]
+	return val, ok
+}
+
 func (a *remoteAnalytics) Count(name string, tags map[string]string, n int) {
 	if !a.enabled {
 		return
 	}
 
 	a.wg.Add(1)
-	go a.count(name, true, tags, n)
+	go a.count(name, tags, n)
 }
 
-func (a *remoteAnalytics) count(name string, includeGlobalTags bool, tags map[string]string, n int) {
+func (a *remoteAnalytics) count(name string, tags map[string]string, n int) {
 	defer a.wg.Done()
 
-	req, err := a.countReq(name, includeGlobalTags, tags, n)
+	req, err := a.countReq(name, tags, n)
 	if err != nil {
 		// Stat reporter can't return errs, just print it.
 		a.logger.Printf("Error: %v\n", err)
@@ -192,9 +184,9 @@ func (a *remoteAnalytics) count(name string, includeGlobalTags bool, tags map[st
 	}
 }
 
-func (a *remoteAnalytics) countReq(name string, includeGlobalTags bool, tags map[string]string, n int) (*http.Request, error) {
+func (a *remoteAnalytics) countReq(name string, tags map[string]string, n int) (*http.Request, error) {
 	// TODO: include n
-	return a.makeReq(a.baseReqBody(name, includeGlobalTags, tags))
+	return a.makeReq(a.baseReqBody(name, tags))
 }
 
 func (a *remoteAnalytics) Incr(name string, tags map[string]string) {
@@ -203,16 +195,19 @@ func (a *remoteAnalytics) Incr(name string, tags map[string]string) {
 	}
 
 	a.wg.Add(1)
-	go a.count(name, true, tags, 1)
+	go a.count(name, tags, 1)
 }
 
-func (a *remoteAnalytics) IncrAnonymous(name string, tags map[string]string) {
-	if !a.enabled {
-		return
+func (a *remoteAnalytics) WithoutGlobalTags() Analytics {
+	return &remoteAnalytics{
+		cli:        a.cli,
+		app:        a.app,
+		url:        a.url,
+		enabled:    a.enabled,
+		logger:     a.logger,
+		wg:         a.wg,
+		globalTags: nil,
 	}
-
-	a.wg.Add(1)
-	go a.count(name, false, tags, 1)
 }
 
 func (a *remoteAnalytics) Timer(name string, dur time.Duration, tags map[string]string) {
@@ -259,8 +254,8 @@ func (a *remoteAnalytics) Flush(timeout time.Duration) {
 }
 
 func (a *remoteAnalytics) timerReq(name string, dur time.Duration, tags map[string]string) (*http.Request, error) {
-	reqBody := a.baseReqBody(name, true, tags)
-	reqBody[keyDuration] = dur
+	reqBody := a.baseReqBody(name, tags)
+	reqBody[TagDuration] = dur
 	return a.makeReq(reqBody)
 }
 
@@ -285,6 +280,10 @@ func NewMemoryAnalytics() *MemoryAnalytics {
 	return &MemoryAnalytics{}
 }
 
+func (a *MemoryAnalytics) GlobalTag(name string) (string, bool) {
+	return "", false
+}
+
 func (a *MemoryAnalytics) Count(name string, tags map[string]string, n int) {
 	a.Counts = append(a.Counts, CountEvent{Name: name, Tags: tags, N: n})
 }
@@ -293,9 +292,9 @@ func (a *MemoryAnalytics) Incr(name string, tags map[string]string) {
 	a.Count(name, tags, 1)
 }
 
-func (a *MemoryAnalytics) IncrAnonymous(name string, tags map[string]string) {
+func (a *MemoryAnalytics) WithoutGlobalTags() Analytics {
 	// MemoryAnalytics doesn't have global tags so there's not really anything different to do
-	a.Count(name, tags, 1)
+	return a
 }
 
 func (a *MemoryAnalytics) Timer(name string, dur time.Duration, tags map[string]string) {

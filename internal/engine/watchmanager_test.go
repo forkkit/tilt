@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -146,10 +145,7 @@ func newWMFixture(t *testing.T) *wmFixture {
 	}()
 
 	f := tempdir.NewTempDirFixture(t)
-	err := os.Chdir(f.Path())
-	if err != nil {
-		t.Fatal(err)
-	}
+	f.Chdir()
 
 	return &wmFixture{
 		ctx:              ctx,
@@ -247,9 +243,7 @@ func (f *wmFixture) SetTiltIgnoreContents(s string) {
 func targetFilesChangedActionsToPaths(actions []targetFilesChangedAction) []string {
 	var paths []string
 	for _, a := range actions {
-		for _, p := range a.files {
-			paths = append(paths, p)
-		}
+		paths = append(paths, a.files...)
 	}
 	return paths
 }

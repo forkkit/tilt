@@ -5,73 +5,97 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"os"
 	"time"
 
 	"github.com/fatih/color"
+	"github.com/mattn/go-isatty"
 	"github.com/opentracing/opentracing-go"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/klog"
 
-	"github.com/windmilleng/tilt/internal/engine"
-
 	"github.com/windmilleng/tilt/internal/analytics"
+	"github.com/windmilleng/tilt/internal/cloud"
+	engineanalytics "github.com/windmilleng/tilt/internal/engine/analytics"
+	"github.com/windmilleng/tilt/internal/engine/buildcontrol"
 	"github.com/windmilleng/tilt/internal/hud"
 	"github.com/windmilleng/tilt/internal/k8s"
-	"github.com/windmilleng/tilt/internal/output"
 	"github.com/windmilleng/tilt/internal/store"
 	"github.com/windmilleng/tilt/internal/tiltfile"
 	"github.com/windmilleng/tilt/internal/tracer"
+	"github.com/windmilleng/tilt/pkg/assets"
 	"github.com/windmilleng/tilt/pkg/logger"
 	"github.com/windmilleng/tilt/pkg/model"
+	"github.com/windmilleng/tilt/web"
 )
 
+const DefaultWebHost = "localhost"
 const DefaultWebPort = 10350
 const DefaultWebDevPort = 46764
 
-var updateModeFlag string = string(engine.UpdateModeAuto)
+var updateModeFlag string = string(buildcontrol.UpdateModeAuto)
 var webModeFlag model.WebMode = model.DefaultWebMode
 var webPort = 0
+var webHost = DefaultWebHost
 var webDevPort = 0
 var noBrowser bool = false
 var logActionsFlag bool = false
 
 type upCmd struct {
-	watch     bool
-	traceTags string
-	hud       bool
-	fileName  string
+	watch                bool
+	traceTags            string
+	hud                  bool
+	fileName             string
+	outputSnapshotOnExit string
 }
 
 func (c *upCmd) register() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "up [<resource_name1>] [<resource_name2>] [...]",
-		Short: "stand up one or more resources (if no resource names specified, stand up all known resources specified in Tiltfile)",
+		Use:                   "up [<tilt flags>] [-- <Tiltfile args>]",
+		DisableFlagsInUseLine: true,
+		Short:                 "Start Tilt with the given Tiltfile args",
+		Long: `
+Starts Tilt and runs services defined in the Tiltfile.
+
+There are two types of args:
+1) Tilt flags, listed below, which are handled entirely by Tilt.
+2) Tiltfile args, which can be anything, and are potentially accessed by config.parse in your Tiltfile.
+
+By default:
+1) Tiltfile args are interpreted as the list of services to start, e.g. tilt up frontend backend.
+2) Running with no Tiltfile args starts all services defined in the Tiltfile
+
+This default behavior does not apply if the Tiltfile uses config.parse or config.set_enabled_resources.
+In that case, see https://tilt.dev/user_config.html and/or comments in your Tiltfile
+`,
 	}
 
 	cmd.Flags().BoolVar(&c.watch, "watch", true, "If true, services will be automatically rebuilt and redeployed when files change. Otherwise, each service will be started once.")
 	cmd.Flags().Var(&webModeFlag, "web-mode", "Values: local, prod. Controls whether to use prod assets or a local dev server")
-	cmd.Flags().StringVar(&updateModeFlag, "update-mode", string(engine.UpdateModeAuto),
-		fmt.Sprintf("Control the strategy Tilt uses for updating instances. Possible values: %v", engine.AllUpdateModes))
+	cmd.Flags().StringVar(&updateModeFlag, "update-mode", string(buildcontrol.UpdateModeAuto),
+		fmt.Sprintf("Control the strategy Tilt uses for updating instances. Possible values: %v", buildcontrol.AllUpdateModes))
 	cmd.Flags().StringVar(&c.traceTags, "traceTags", "", "tags to add to spans for easy querying, of the form: key1=val1,key2=val2")
 	cmd.Flags().BoolVar(&c.hud, "hud", true, "If true, tilt will open in HUD mode.")
 	cmd.Flags().BoolVar(&logActionsFlag, "logactions", false, "log all actions and state changes")
 	cmd.Flags().IntVar(&webPort, "port", DefaultWebPort, "Port for the Tilt HTTP server. Set to 0 to disable.")
+	cmd.Flags().StringVar(&webHost, "host", DefaultWebHost, "Host for the Tilt HTTP server and default host for any port-forwards. Set to 0.0.0.0 to listen on all interfaces.")
 	cmd.Flags().IntVar(&webDevPort, "webdev-port", DefaultWebDevPort, "Port for the Tilt Dev Webpack server. Only applies when using --web-mode=local")
 	cmd.Flags().Lookup("logactions").Hidden = true
 	cmd.Flags().StringVar(&c.fileName, "file", tiltfile.FileName, "Path to Tiltfile")
 	cmd.Flags().BoolVar(&noBrowser, "no-browser", false, "If true, web UI will not open on startup.")
+	cmd.Flags().StringVar(&c.outputSnapshotOnExit, "output-snapshot-on-exit", "", "If specified, Tilt will dump a snapshot of its state to the specified path when it exits")
 
 	return cmd
 }
 
 func (c *upCmd) run(ctx context.Context, args []string) error {
 	a := analytics.Get(ctx)
-	a.Incr("cmd.up", map[string]string{
+	cmdUpTags := engineanalytics.CmdUpTags(map[string]string{
 		"watch": fmt.Sprintf("%v", c.watch),
 		"mode":  string(updateModeFlag),
 	})
-	a.IncrIfUnopted("analytics.up.optdefault")
+	a.Incr("cmd.up", cmdUpTags.AsMap())
 	defer a.Flush(time.Second)
 
 	span, ctx := opentracing.StartSpanFromContext(ctx, "Up")
@@ -88,22 +112,26 @@ func (c *upCmd) run(ctx context.Context, args []string) error {
 
 	logOutput(fmt.Sprintf("Starting Tilt (%s)…", buildStamp()))
 
-	if isAnalyticsDisabledFromEnv() {
-		logOutput("Tilt analytics manually disabled by environment")
+	if ok, reason := analytics.IsAnalyticsDisabledFromEnv(); ok {
+		log.Printf("Tilt analytics disabled: %s", reason)
 	}
 
-	threads, err := wireThreads(ctx, a)
+	hudEnabled := c.hud && isatty.IsTerminal(os.Stdout.Fd())
+	cmdUpDeps, err := wireCmdUp(ctx, hud.HudEnabled(hudEnabled), a, cmdUpTags)
 	if err != nil {
 		deferred.SetOutput(deferred.Original())
 		return err
 	}
 
-	upper := threads.upper
-	h := threads.hud
+	upper := cmdUpDeps.Upper
+	h := cmdUpDeps.Hud
 
 	l := store.NewLogActionLogger(ctx, upper.Dispatch)
 	deferred.SetOutput(l)
 	ctx = redirectLogs(ctx, l)
+	if c.outputSnapshotOnExit != "" {
+		defer cloud.WriteSnapshot(ctx, cmdUpDeps.Store, c.outputSnapshotOnExit)
+	}
 
 	if trace {
 		traceID, err := tracer.TraceID(ctx)
@@ -117,11 +145,7 @@ func (c *upCmd) run(ctx context.Context, args []string) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	if c.hud {
-		err := output.CaptureAllOutput(logger.Get(ctx).Writer(logger.InfoLvl))
-		if err != nil {
-			logger.Get(ctx).Infof("Error capturing stdout and stderr: %v", err)
-		}
+	if hudEnabled {
 		g.Go(func() error {
 			err := h.Run(ctx, upper.Dispatch, hud.DefaultRefreshInterval)
 			return err
@@ -130,7 +154,7 @@ func (c *upCmd) run(ctx context.Context, args []string) error {
 
 	g.Go(func() error {
 		defer cancel()
-		return upper.Start(ctx, args, threads.tiltBuild, c.watch, c.fileName, c.hud, a.Opt(), threads.token, string(threads.cloudAddress))
+		return upper.Start(ctx, args, cmdUpDeps.TiltBuild, c.watch, c.fileName, hudEnabled, a.UserOpt(), cmdUpDeps.Token, string(cmdUpDeps.CloudAddress))
 	})
 
 	err = g.Wait()
@@ -153,8 +177,8 @@ func logOutput(s string) {
 	log.Print(color.GreenString(s))
 }
 
-func provideUpdateModeFlag() engine.UpdateModeFlag {
-	return engine.UpdateModeFlag(updateModeFlag)
+func provideUpdateModeFlag() buildcontrol.UpdateModeFlag {
+	return buildcontrol.UpdateModeFlag(updateModeFlag)
 }
 
 func provideLogActions() store.LogActionsFlag {
@@ -179,6 +203,10 @@ func provideWebMode(b model.TiltBuild) (model.WebMode, error) {
 	return "", model.UnrecognizedWebModeError(string(webModeFlag))
 }
 
+func provideWebHost() model.WebHost {
+	return model.WebHost(webHost)
+}
+
 func provideWebPort() model.WebPort {
 	return model.WebPort(webPort)
 }
@@ -186,18 +214,34 @@ func provideWebPort() model.WebPort {
 func provideNoBrowserFlag() model.NoBrowser {
 	return model.NoBrowser(noBrowser)
 }
-func provideWebDevPort() model.WebDevPort {
-	return model.WebDevPort(webDevPort)
-}
 
-func provideWebURL(webPort model.WebPort) (model.WebURL, error) {
+func provideWebURL(webHost model.WebHost, webPort model.WebPort) (model.WebURL, error) {
 	if webPort == 0 {
 		return model.WebURL{}, nil
 	}
 
-	u, err := url.Parse(fmt.Sprintf("http://localhost:%d/", webPort))
+	u, err := url.Parse(fmt.Sprintf("http://%s:%d/", webHost, webPort))
 	if err != nil {
 		return model.WebURL{}, err
 	}
 	return model.WebURL(*u), nil
+}
+
+func provideAssetServer(mode model.WebMode, version model.WebVersion) (assets.Server, error) {
+	if mode == model.ProdWebMode {
+		return assets.NewProdServer(assets.ProdAssetBucket, version)
+	}
+	if mode == model.PrecompiledWebMode || mode == model.LocalWebMode {
+		path, err := web.StaticPath()
+		if err != nil {
+			return nil, err
+		}
+		pkgDir := assets.PackageDir(path)
+		if mode == model.PrecompiledWebMode {
+			return assets.NewPrecompiledServer(pkgDir), nil
+		} else {
+			return assets.NewDevServer(pkgDir, model.WebDevPort(webDevPort))
+		}
+	}
+	return nil, model.UnrecognizedWebModeError(string(mode))
 }

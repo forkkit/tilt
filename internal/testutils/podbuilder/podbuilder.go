@@ -17,7 +17,6 @@ import (
 	"github.com/windmilleng/tilt/pkg/model"
 )
 
-const FakeDeployID = model.DeployID(1234567890)
 const fakeContainerID = container.ID("myTestContainer")
 
 func FakeContainerID() container.ID {
@@ -56,28 +55,34 @@ type PodBuilder struct {
 	t        testing.TB
 	manifest model.Manifest
 
-	podID          string
-	phase          string
-	creationTime   time.Time
-	deletionTime   time.Time
-	deployID       model.DeployID
-	restartCount   int
-	extraPodLabels map[string]string
-	deploymentUID  types.UID
+	podID           string
+	phase           string
+	creationTime    time.Time
+	deletionTime    time.Time
+	restartCount    int
+	extraPodLabels  map[string]string
+	deploymentUID   types.UID
+	resourceVersion string
 
 	// keyed by container index -- i.e. the first container will have image: imageRefs[0] and ID: cIDs[0], etc.
 	// If there's no entry at index i, we'll use a dummy value.
 	imageRefs map[int]string
 	cIDs      map[int]string
+	cReady    map[int]bool
+
+	setPodTemplateSpecHash bool
+	podTemplateSpecHash    k8s.PodTemplateSpecHash
 }
 
 func New(t testing.TB, manifest model.Manifest) PodBuilder {
 	return PodBuilder{
-		t:              t,
-		manifest:       manifest,
-		imageRefs:      make(map[int]string),
-		cIDs:           make(map[int]string),
-		extraPodLabels: make(map[string]string),
+		t:                      t,
+		manifest:               manifest,
+		imageRefs:              make(map[int]string),
+		cIDs:                   make(map[int]string),
+		cReady:                 make(map[int]bool),
+		extraPodLabels:         make(map[string]string),
+		setPodTemplateSpecHash: true,
 	}
 }
 
@@ -90,12 +95,27 @@ func (b PodBuilder) ManifestName() model.ManifestName {
 	return b.manifest.Name
 }
 
+func (b PodBuilder) WithTemplateSpecHash(s k8s.PodTemplateSpecHash) PodBuilder {
+	b.podTemplateSpecHash = s
+	return b
+}
+
+func (b PodBuilder) WithNoTemplateSpecHash() PodBuilder {
+	b.setPodTemplateSpecHash = false
+	return b
+}
+
 func (b PodBuilder) RestartCount() int {
 	return b.restartCount
 }
 
 func (b PodBuilder) WithRestartCount(restartCount int) PodBuilder {
 	b.restartCount = restartCount
+	return b
+}
+
+func (b PodBuilder) WithResourceVersion(rv string) PodBuilder {
+	b.resourceVersion = rv
 	return b
 }
 
@@ -135,6 +155,15 @@ func (b PodBuilder) WithContainerIDAtIndex(cID container.ID, index int) PodBuild
 	return b
 }
 
+func (b PodBuilder) WithContainerReady(ready bool) PodBuilder {
+	return b.WithContainerReadyAtIndex(ready, 0)
+}
+
+func (b PodBuilder) WithContainerReadyAtIndex(ready bool, index int) PodBuilder {
+	b.cReady[index] = ready
+	return b
+}
+
 func (b PodBuilder) WithCreationTime(creationTime time.Time) PodBuilder {
 	b.creationTime = creationTime
 	return b
@@ -145,14 +174,9 @@ func (b PodBuilder) WithDeletionTime(deletionTime time.Time) PodBuilder {
 	return b
 }
 
-func (b PodBuilder) WithDeployID(deployID model.DeployID) PodBuilder {
-	b.deployID = deployID
-	return b
-}
-
-func (b PodBuilder) PodID() string {
+func (b PodBuilder) PodID() k8s.PodID {
 	if b.podID != "" {
-		return b.podID
+		return k8s.PodID(b.podID)
 	}
 	return "fakePodID"
 }
@@ -188,9 +212,10 @@ func (b PodBuilder) DeploymentUID() types.UID {
 func (b PodBuilder) buildDeployment() *appsv1.Deployment {
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:   b.buildDeploymentName(),
-			Labels: k8s.NewTiltLabelMap(),
-			UID:    b.DeploymentUID(),
+			Name:      b.buildDeploymentName(),
+			Namespace: k8s.DefaultNamespace.String(),
+			Labels:    k8s.NewTiltLabelMap(),
+			UID:       b.DeploymentUID(),
 		},
 	}
 }
@@ -199,9 +224,10 @@ func (b PodBuilder) buildReplicaSet() *appsv1.ReplicaSet {
 	dep := b.buildDeployment()
 	return &appsv1.ReplicaSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:   b.buildReplicaSetName(),
-			UID:    b.buildReplicaSetUID(),
-			Labels: k8s.NewTiltLabelMap(),
+			Name:      b.buildReplicaSetName(),
+			Namespace: k8s.DefaultNamespace.String(),
+			UID:       b.buildReplicaSetUID(),
+			Labels:    k8s.NewTiltLabelMap(),
 			OwnerReferences: []metav1.OwnerReference{
 				k8s.RuntimeObjToOwnerRef(dep),
 			},
@@ -224,10 +250,6 @@ func (b PodBuilder) buildDeletionTime() *metav1.Time {
 }
 
 func (b PodBuilder) buildLabels(tSpec *v1.PodTemplateSpec) map[string]string {
-	deployID := b.deployID
-	if deployID.Empty() {
-		deployID = FakeDeployID
-	}
 	labels := k8s.NewTiltLabelMap()
 	for k, v := range tSpec.Labels {
 		labels[k] = v
@@ -235,6 +257,19 @@ func (b PodBuilder) buildLabels(tSpec *v1.PodTemplateSpec) map[string]string {
 	for k, v := range b.extraPodLabels {
 		labels[k] = v
 	}
+
+	if b.setPodTemplateSpecHash {
+		podTemplateSpecHash := b.podTemplateSpecHash
+		if podTemplateSpecHash == "" {
+			var err error
+			podTemplateSpecHash, err = k8s.HashPodTemplateSpec(tSpec)
+			if err != nil {
+				panic(fmt.Sprintf("error computing pod template spec hash: %v", err))
+			}
+		}
+		labels[k8s.TiltPodTemplateHashLabel] = string(podTemplateSpecHash)
+	}
+
 	return labels
 }
 
@@ -275,10 +310,21 @@ func (b PodBuilder) buildContainerStatuses(spec v1.PodSpec) []v1.ContainerStatus
 		if i == 0 {
 			restartCount = b.restartCount
 		}
+		ready, ok := b.cReady[i]
+		// if not specified, default to true
+		ready = !ok || ready
+
+		state := v1.ContainerState{
+			Running: &v1.ContainerStateRunning{
+				StartedAt: metav1.NewTime(time.Now()),
+			},
+		}
+
 		result[i] = v1.ContainerStatus{
 			Name:         cSpec.Name,
 			Image:        b.buildImage(cSpec.Image, i),
-			Ready:        true,
+			Ready:        ready,
+			State:        state,
 			ContainerID:  b.buildContainerID(i),
 			RestartCount: int32(restartCount),
 		}
@@ -335,6 +381,12 @@ func (b PodBuilder) Build() *v1.Pod {
 	b.validateImageRefs(numContainers)
 	b.validateContainerIDs(numContainers)
 
+	// Generate buildLabels from the incoming pod spec, before we've modified it,
+	// so that it matches the spec we generate from the manifest itself.
+	// Can override this behavior by setting b.PodTemplateSpecHash (or
+	// by setting b.setPodTemplateSpecHash = false )
+	labels := b.buildLabels(tSpec)
+
 	for i, container := range spec.Containers {
 		container.Image = b.buildImage(container.Image, i)
 		spec.Containers[i] = container
@@ -342,14 +394,16 @@ func (b PodBuilder) Build() *v1.Pod {
 
 	return &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:              b.PodID(),
+			Name:              string(b.PodID()),
+			Namespace:         k8s.DefaultNamespace.String(),
 			CreationTimestamp: b.buildCreationTime(),
 			DeletionTimestamp: b.buildDeletionTime(),
-			Labels:            b.buildLabels(tSpec),
+			Labels:            labels,
 			UID:               b.buildPodUID(),
 			OwnerReferences: []metav1.OwnerReference{
 				k8s.RuntimeObjToOwnerRef(b.buildReplicaSet()),
 			},
+			ResourceVersion: b.resourceVersion,
 		},
 		Spec: spec,
 		Status: v1.PodStatus{

@@ -3,14 +3,17 @@ import { ReactComponent as LogoWordmarkSvg } from "./assets/svg/logo-wordmark-gr
 import AnsiLine from "./AnsiLine"
 import TimeAgo from "react-timeago"
 import "./AlertPane.scss"
-import { Resource } from "./types"
 import { timeAgoFormatter } from "./timeFormatters"
-import { Alert, hasAlert } from "./alerts"
+import { getResourceAlerts, hasAlert } from "./alerts"
 import PathBuilder from "./PathBuilder"
+import LogStore from "./LogStore"
+
+type Resource = Proto.webviewResource
 
 type AlertsProps = {
   pathBuilder: PathBuilder
   resources: Array<Resource>
+  logStore: LogStore | null
 }
 
 function logToLines(s: string) {
@@ -38,13 +41,14 @@ class AlertPane extends PureComponent<AlertsProps> {
     let formatter = timeAgoFormatter
     let alertElements: Array<JSX.Element> = []
     let resources = this.props.resources
-    let isLocal = this.props.pathBuilder.isLocal()
+    let isSnapshot = this.props.pathBuilder.isSnapshot()
 
     let alertResources = resources.filter(r => hasAlert(r))
     alertResources.forEach(resource => {
-      resource.Alerts.forEach(alert => {
+      let resName = resource.name ?? ""
+      getResourceAlerts(resource, this.props.logStore).forEach(alert => {
         let dismissButton = <div />
-        if (alert.dismissHandler && isLocal) {
+        if (alert.dismissHandler && !isSnapshot) {
           dismissButton = (
             <button
               className="AlertPane-dismissButton"
@@ -55,7 +59,7 @@ class AlertPane extends PureComponent<AlertsProps> {
           )
         }
         alertElements.push(
-          <li key={alert.alertType + resource.Name} className="AlertPane-item">
+          <li key={alert.alertType + resName} className="AlertPane-item">
             <header>
               <div className="AlertPane-headerDiv">
                 <h3 className="AlertPane-headerDiv-header">{alert.header}</h3>

@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/stretchr/testify/assert"
 
 	"github.com/windmilleng/tilt/internal/dockerignore"
@@ -42,7 +44,7 @@ func TestEventOrdering(t *testing.T) {
 
 	count := 8
 	dirs := make([]string, count)
-	for i, _ := range dirs {
+	for i := range dirs {
 		dir := f.TempDir("watched")
 		dirs[i] = dir
 		f.watch(dir)
@@ -74,7 +76,7 @@ func TestGitBranchSwitch(t *testing.T) {
 
 	count := 10
 	dirs := make([]string, count)
-	for i, _ := range dirs {
+	for i := range dirs {
 		dir := f.TempDir("watched")
 		dirs[i] = dir
 		f.watch(dir)
@@ -95,7 +97,8 @@ func TestGitBranchSwitch(t *testing.T) {
 		}
 
 		if i != 0 {
-			os.RemoveAll(dir)
+			err := os.RemoveAll(dir)
+			require.NoError(t, err)
 		}
 	}
 
@@ -313,7 +316,12 @@ func TestWatchBrokenLink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer newRoot.TearDown()
+	defer func() {
+		err := newRoot.TearDown()
+		if err != nil {
+			fmt.Printf("error tearing down temp dir: %v\n", err)
+		}
+	}()
 
 	link := filepath.Join(newRoot.Path(), "brokenLink")
 	missingFile := filepath.Join(newRoot.Path(), "missingFile")
@@ -323,7 +331,8 @@ func TestWatchBrokenLink(t *testing.T) {
 	}
 
 	f.watch(newRoot.Path())
-	os.Remove(link)
+	err = os.Remove(link)
+	require.NoError(t, err)
 	f.assertEvents(link)
 }
 
@@ -656,7 +665,7 @@ func (f *notifyFixture) fsyncWithRetryCount(retryCount int) {
 	anySyncPath := filepath.Join(f.paths[0], "sync-")
 	timeout := time.After(250 * time.Millisecond)
 
-	f.WriteFile(syncPath, fmt.Sprintf("%s", time.Now()))
+	f.WriteFile(syncPath, time.Now().String())
 
 F:
 	for {
@@ -700,11 +709,11 @@ func (f *notifyFixture) closeWatcher() {
 
 	// drain channels from watcher
 	go func() {
-		for _ = range notify.Events() {
+		for range notify.Events() {
 		}
 	}()
 	go func() {
-		for _ = range notify.Errors() {
+		for range notify.Errors() {
 		}
 	}()
 }

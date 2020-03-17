@@ -20,6 +20,7 @@ type RStore interface {
 	Dispatch(action Action)
 	RLockState() EngineState
 	RUnlockState()
+	StateMutex() *sync.RWMutex
 }
 
 // A central state store, modeled after the Reactive programming UX pattern.
@@ -73,6 +74,10 @@ func NewStoreForTesting() (st *Store, getActions func() []Action) {
 		return append([]Action{}, actions...)
 	}
 	return NewStore(reducer, false), getActions
+}
+
+func (s *Store) StateMutex() *sync.RWMutex {
+	return &s.stateMu
 }
 
 func (s *Store) AddSubscriber(ctx context.Context, sub Subscriber) {
@@ -177,12 +182,20 @@ func (s *Store) maybeFinished() (bool, error) {
 		return true, nil
 	}
 
+	if state.PanicExited != nil {
+		return true, state.PanicExited
+	}
+
+	if state.FatalError != nil && !state.HUDEnabled {
+		return true, state.FatalError
+	}
+
 	if len(state.ManifestTargets) == 0 {
 		return false, nil
 	}
 
-	finished := !state.WatchFiles &&
-		state.CompletedBuildCount == state.InitialBuildsQueued
+	finished := !state.WatchFiles && state.InitialBuildsCompleted()
+
 	return finished, nil
 }
 

@@ -1,32 +1,39 @@
-import HUD from "./HUD"
-import { getResourceAlerts } from "./alerts"
-import { ShowFatalErrorModal } from "./types"
+import { SocketState, Snapshot } from "./types"
+import HudState from "./HudState"
+import PathBuilder from "./PathBuilder"
+
+type Resource = Proto.webviewResource
+type K8sResourceInfo = Proto.webviewK8sResourceInfo
+
+interface HudInt {
+  setAppState: <K extends keyof HudState>(state: Pick<HudState, K>) => void
+  setHistoryLocation: (path: string) => void
+}
 
 // A Websocket that automatically retries.
-
 class AppController {
   url: string
   loadCount: number
   liveSocket: boolean
   tryConnectCount: number
   socket: WebSocket | null = null
-  component: HUD
+  component: HudInt
   disposed: boolean = false
+  pb: PathBuilder
 
   /**
-   * @param url The url of the websocket to pull data from
+   * @param pathBuilder a PathBuilder
    * @param component The top-level component for the app.
    *     Has one method, setAppState, that sets the global state of the
-   *     app. This state has two properties
-   *     - Message (string): A status message about the state of the socket
-   *     - View (Object): A JSON serialization of the Go struct in internal/renderer/view
+   *     app.
    */
-  constructor(url: string, component: HUD) {
+  constructor(pathBuilder: PathBuilder, component: HudInt) {
     if (!component.setAppState) {
       throw new Error("App component has no setAppState method")
     }
 
-    this.url = url
+    this.pb = pathBuilder
+    this.url = pathBuilder.getDataUrl()
     this.component = component
     this.tryConnectCount = 0
     this.liveSocket = false
@@ -36,6 +43,8 @@ class AppController {
   createNewSocket() {
     this.tryConnectCount++
     this.socket = new WebSocket(this.url)
+    let socket = this.socket
+
     this.socket.addEventListener("close", this.onSocketClose.bind(this))
     this.socket.addEventListener("message", event => {
       if (!this.liveSocket) {
@@ -44,30 +53,22 @@ class AppController {
       this.liveSocket = true
       this.tryConnectCount = 0
 
-      let data = JSON.parse(event.data)
-
-      data.Resources = this.setDefaultResourceInfo(data.Resources)
-      // @ts-ignore
-      this.component.setAppState({ View: data })
-    })
-  }
-
-  setDefaultResourceInfo(resources: Array<any>): Array<any> {
-    return resources.map(r => {
-      if (!r.K8sResourceInfo && !r.DCResourceInfo) {
-        r.K8sResourceInfo = {
-          PodName: "",
-          PodCreationTime: "",
-          PodUpdateStartTime: "",
-          PodStatus: "",
-          PodStatusMessage: "",
-          PodRestarts: 0,
-          PodLog: "",
-          Endpoints: [],
+      let data: Proto.webviewView = JSON.parse(event.data)
+      let toCheckpoint = data.logList?.toCheckpoint
+      if (toCheckpoint && toCheckpoint > 0) {
+        let tiltStartTime = data.tiltStartTime
+        let response: Proto.webviewAckWebsocketRequest = {
+          toCheckpoint,
+          tiltStartTime,
         }
+        socket.send(JSON.stringify(response))
       }
-      r.Alerts = getResourceAlerts(r)
-      return r
+
+      // @ts-ignore
+      this.component.setAppState({
+        view: data,
+        socketState: SocketState.Active,
+      })
     })
   }
 
@@ -87,12 +88,7 @@ class AppController {
 
     if (wasAlive) {
       this.component.setAppState({
-        View: null,
-        Message: "Disconnected…",
-        IsSidebarClosed: false,
-        SnapshotLink: "",
-        showSnapshotModal: false,
-        showFatalErrorModal: ShowFatalErrorModal.Default,
+        socketState: SocketState.Closed,
       })
       this.createNewSocket()
       return
@@ -100,7 +96,7 @@ class AppController {
 
     let backoff = Math.pow(2, this.tryConnectCount) * 1000
     let maxTimeout = 10 * 1000 // 10sec
-    let isLocal = this.url.indexOf("ws://localhost") == 0
+    let isLocal = this.url.indexOf("ws://localhost") === 0
     if (isLocal) {
       // if this is a local connection, max out at 1.5sec.
       // this makes it a bit easier to detect when a window is already open.
@@ -112,14 +108,11 @@ class AppController {
       if (this.disposed) {
         return
       }
-      let message = this.loadCount ? "Reconnecting…" : "Loading…"
+      let state: SocketState = this.loadCount
+        ? SocketState.Reconnecting
+        : SocketState.Loading
       this.component.setAppState({
-        View: null,
-        Message: message,
-        IsSidebarClosed: false,
-        SnapshotLink: "",
-        showSnapshotModal: false,
-        showFatalErrorModal: ShowFatalErrorModal.Default,
+        socketState: state,
       })
       this.createNewSocket()
     }, timeout)
@@ -129,10 +122,21 @@ class AppController {
     let url = this.url
     fetch(url)
       .then(resp => resp.json())
-      .then(data => {
-        data.View.Resources = this.setDefaultResourceInfo(data.View.Resources)
-        // @ts-ignore
-        this.component.setAppState({ View: data.View })
+      .then((data: Snapshot) => {
+        data.view = data.view || {}
+
+        this.component.setAppState({
+          view: data.view,
+          isSidebarClosed: data.isSidebarClosed,
+        })
+        if (data.path) {
+          this.component.setHistoryLocation(this.pb.path(data.path))
+        }
+        if (data.snapshotHighlight) {
+          this.component.setAppState({
+            snapshotHighlight: data.snapshotHighlight,
+          })
+        }
       })
       .catch(err => {
         // TODO(dmiller): set app state with an error message

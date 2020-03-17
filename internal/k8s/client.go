@@ -22,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/version"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	apiv1 "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -88,9 +89,9 @@ type Client interface {
 	ContainerLogs(ctx context.Context, podID PodID, cName container.Name, n Namespace, startTime time.Time) (io.ReadCloser, error)
 
 	// Opens a tunnel to the specified pod+port. Returns the tunnel's local port and a function that closes the tunnel
-	CreatePortForwarder(ctx context.Context, namespace Namespace, podID PodID, optionalLocalPort, remotePort int) (PortForwarder, error)
+	CreatePortForwarder(ctx context.Context, namespace Namespace, podID PodID, optionalLocalPort, remotePort int, host string) (PortForwarder, error)
 
-	WatchPods(ctx context.Context, lps labels.Selector) (<-chan *v1.Pod, error)
+	WatchPods(ctx context.Context, lps labels.Selector) (<-chan ObjectUpdate, error)
 
 	WatchServices(ctx context.Context, lps labels.Selector) (<-chan *v1.Service, error)
 
@@ -100,8 +101,11 @@ type Client interface {
 
 	ContainerRuntime(ctx context.Context) container.Runtime
 
-	// Some clusters support a private image registry that we can push to.
-	PrivateRegistry(ctx context.Context) container.Registry
+	// Some clusters support a local image registry that we can push to.
+	LocalRegistry(ctx context.Context) container.Registry
+
+	// Some clusters support a node IP where all servers are reachable.
+	NodeIP(ctx context.Context) NodeIP
 
 	Exec(ctx context.Context, podID PodID, cName container.Name, n Namespace, cmd []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) error
 }
@@ -117,6 +121,7 @@ type K8sClient struct {
 	dynamic           dynamic.Interface
 	runtimeAsync      *runtimeAsync
 	registryAsync     *registryAsync
+	nodeIPAsync       *nodeIPAsync
 	drm               meta.RESTMapper
 }
 
@@ -133,7 +138,7 @@ func ProvideK8sClient(
 	clientLoader clientcmd.ClientConfig) Client {
 	if env == EnvNone {
 		// No k8s, so no need to get any further configs
-		return &explodingClient{err: fmt.Errorf("Kubernetes context not set")}
+		return &explodingClient{err: fmt.Errorf("Kubernetes context not set in %s", clientLoader.ConfigAccess().GetLoadingPrecedence())}
 	}
 
 	restConfig, err := maybeRESTConfig.Config, maybeRESTConfig.Error
@@ -149,6 +154,7 @@ func ProvideK8sClient(
 	core := clientset.CoreV1()
 	runtimeAsync := newRuntimeAsync(core)
 	registryAsync := newRegistryAsync(env, core, runtimeAsync)
+	nodeIPAsync := newNodeIPAsync(env)
 
 	di, err := dynamic.NewForConfig(restConfig)
 	if err != nil {
@@ -160,12 +166,7 @@ func ProvideK8sClient(
 		return &explodingClient{fmt.Errorf("unable to create discovery client: %v", err)}
 	}
 
-	apiGroupResources, err := restmapper.GetAPIGroupResources(discoveryClient)
-	if err != nil {
-		return &explodingClient{fmt.Errorf("unable to fetch API Group Resources: %v", err)}
-	}
-
-	drm := restmapper.NewDiscoveryRESTMapper(apiGroupResources)
+	drm := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(discoveryClient))
 
 	// TODO(nick): I'm not happy about the way that pkg/browser uses global writers.
 	writer := logger.Get(ctx).Writer(logger.DebugLvl)
@@ -182,6 +183,7 @@ func ProvideK8sClient(
 		clientset:         clientset,
 		runtimeAsync:      runtimeAsync,
 		registryAsync:     registryAsync,
+		nodeIPAsync:       nodeIPAsync,
 		dynamic:           di,
 		drm:               drm,
 	}
@@ -244,17 +246,16 @@ func (k K8sClient) Upsert(ctx context.Context, entities []K8sEntity) ([]K8sEntit
 
 	result := make([]K8sEntity, 0, len(entities))
 
-	// First apply all the entities on which something else might depend
-	withDependents, entities := EntitiesWithDependentsAndRest(entities)
-	if len(withDependents) > 0 {
-		newEntities, err := k.applyEntitiesAndMaybeForce(ctx, withDependents)
+	mutable, immutable := MutableAndImmutableEntities(entities)
+
+	if len(mutable) > 0 {
+		newEntities, err := k.applyEntitiesAndMaybeForce(ctx, mutable)
 		if err != nil {
 			return nil, err
 		}
 		result = append(result, newEntities...)
 	}
 
-	immutable := ImmutableEntities(entities)
 	if len(immutable) > 0 {
 		newEntities, err := k.forceReplaceEntities(ctx, immutable)
 		if err != nil {
@@ -263,14 +264,6 @@ func (k K8sClient) Upsert(ctx context.Context, entities []K8sEntity) ([]K8sEntit
 		result = append(result, newEntities...)
 	}
 
-	mutable := MutableEntities(entities)
-	if len(mutable) > 0 {
-		newEntities, err := k.applyEntitiesAndMaybeForce(ctx, mutable)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, newEntities...)
-	}
 	return result, nil
 }
 
@@ -299,7 +292,7 @@ func (k K8sClient) applyEntitiesAndMaybeForce(ctx context.Context, entities []K8
 		// dependant pods get deleted rather than orphaned. We WANT these pods to be deleted
 		// and recreated so they have all the new labels, etc. of their controlling k8s entity.
 		logger.Get(ctx).Infof("Falling back to 'kubectl delete && apply' on immutable field error")
-		stdout, stderr, err = k.actOnEntities(ctx, []string{"delete"}, entities)
+		_, stderr, err = k.actOnEntities(ctx, []string{"delete"}, entities)
 		if err != nil {
 			return nil, errors.Wrapf(err, "kubectl delete (as part of delete && apply):\nstderr: %s", stderr)
 		}

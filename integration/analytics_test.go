@@ -30,7 +30,7 @@ func newAnalyticsFixture(t *testing.T) *analyticsFixture {
 		k8sFixture: newK8sFixture(t, "analytics"),
 		tempDir:    td,
 	}
-	af.tiltEnviron[WindmillDirEnvVarName] = td.Path()
+	af.tilt.Environ[WindmillDirEnvVarName] = td.Path()
 
 	af.SetupAnalyticsServer()
 
@@ -43,8 +43,9 @@ func (af *analyticsFixture) SetupAnalyticsServer() {
 		af.t.FailNow()
 	}
 	af.mss = mss
-	delete(af.tiltEnviron, "TILT_DISABLE_ANALYTICS")
-	af.tiltEnviron[AnalyticsUrlEnvVarName] = fmt.Sprintf("http://localhost:%d/report", port)
+	af.tilt.Environ["TILT_DISABLE_ANALYTICS"] = ""
+	af.tilt.Environ["CI"] = ""
+	af.tilt.Environ[AnalyticsUrlEnvVarName] = fmt.Sprintf("http://localhost:%d/report", port)
 }
 
 func (af *analyticsFixture) TearDown() {
@@ -101,11 +102,11 @@ func TestOptedIn(t *testing.T) {
 
 	f.SetOpt(analytics.OptIn)
 
-	f.TiltUp("oneup")
+	f.TiltUp("analytics")
 
 	ctx, cancel := context.WithTimeout(f.ctx, time.Minute)
 	defer cancel()
-	f.WaitForAllPodsReady(ctx, "app=oneup")
+	f.WaitForAllPodsReady(ctx, "app=analytics")
 
 	var observedEventNames []string
 	for _, c := range f.mss.ma.Counts {
@@ -131,16 +132,11 @@ func TestOptedOut(t *testing.T) {
 
 	f.SetOpt(analytics.OptOut)
 
-	f.TiltUp("oneup")
+	f.TiltUp("analytics")
 
 	ctx, cancel := context.WithTimeout(f.ctx, time.Minute)
 	defer cancel()
-	f.WaitForAllPodsReady(ctx, "app=oneup")
-
-	var observedEventNames []string
-	for _, c := range f.mss.ma.Counts {
-		observedEventNames = append(observedEventNames, c.Name)
-	}
+	f.WaitForAllPodsReady(ctx, "app=analytics")
 
 	assert.Equal(t, 0, len(f.mss.ma.Counts))
 }
@@ -151,24 +147,26 @@ func TestOptDefault(t *testing.T) {
 
 	f.SetOpt(analytics.OptDefault)
 
-	f.TiltUp("oneup")
+	f.TiltUp("analytics")
 
 	ctx, cancel := context.WithTimeout(f.ctx, time.Minute)
 	defer cancel()
-	f.WaitForAllPodsReady(ctx, "app=oneup")
+	f.WaitForAllPodsReady(ctx, "app=analytics")
 
-	var metricNames []string
-
+	var observedEventNames []string
 	for _, c := range f.mss.ma.Counts {
-		var tagKeys []string
-		for k := range c.Tags {
-			tagKeys = append(tagKeys, k)
-		}
-		// optdefault is not allowed to send any tags other than time & version
-		assert.ElementsMatch(t, []string{"time", "version"}, tagKeys)
-
-		metricNames = append(metricNames, c.Name)
+		observedEventNames = append(observedEventNames, c.Name)
 	}
 
-	assert.Contains(t, metricNames, "tilt.analytics.up.optdefault")
+	var observedTimerNames []string
+	for _, c := range f.mss.ma.Timers {
+		observedTimerNames = append(observedTimerNames, c.Name)
+	}
+
+	// just check that a couple metrics were successfully reported rather than asserting an exhaustive list
+	// the goal is to ensure that analytics is working in general, not to test which specific metrics are reported
+	// and we don't want to have to update this every time we change which metrics we report
+	assert.Contains(t, observedEventNames, "tilt.cmd.up")
+	assert.Contains(t, observedEventNames, "tilt.tiltfile.loaded")
+	assert.Contains(t, observedTimerNames, "tilt.tiltfile.load")
 }

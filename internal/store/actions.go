@@ -8,7 +8,9 @@ import (
 	v1 "k8s.io/api/core/v1"
 
 	"github.com/windmilleng/tilt/internal/k8s"
+	"github.com/windmilleng/tilt/pkg/logger"
 	"github.com/windmilleng/tilt/pkg/model"
+	"github.com/windmilleng/tilt/pkg/model/logstore"
 )
 
 type ErrorAction struct {
@@ -21,64 +23,61 @@ func NewErrorAction(err error) ErrorAction {
 	return ErrorAction{Error: err}
 }
 
-type LogAction interface {
-	Action
-	model.LogEvent
-
-	// Ideally, all logs should be associated with a source.
-	//
-	// In practice, not all logs have an obvious source identifier,
-	// so this might be empty.
-	//
-	// Right now, that source is a ManifestName. But in the future,
-	// this might make more sense as another kind of identifier.
-	//
-	// (As of this writing, we have TargetID as an abstract build-time
-	// source identifier, but no generic run-time source identifier)
-	Source() model.ManifestName
-}
-
-type LogEvent struct {
+type LogAction struct {
 	mn        model.ManifestName
+	spanID    logstore.SpanID
 	timestamp time.Time
+	fields    logger.Fields
 	msg       []byte
+	level     logger.Level
 }
 
-func (LogEvent) Action() {}
+func (LogAction) Action() {}
 
-func (le LogEvent) Source() model.ManifestName {
+func (le LogAction) ManifestName() model.ManifestName {
 	return le.mn
 }
 
-func (le LogEvent) Time() time.Time {
+func (le LogAction) Level() logger.Level {
+	return le.level
+}
+
+func (le LogAction) Time() time.Time {
 	return le.timestamp
 }
 
-func (le LogEvent) Message() []byte {
+func (le LogAction) Fields() logger.Fields {
+	return le.fields
+}
+
+func (le LogAction) Message() []byte {
 	return le.msg
 }
 
-func (le *LogEvent) ScrubSecret(secret model.Secret) {
-	le.msg = secret.Scrub(le.msg)
+func (le LogAction) SpanID() logstore.SpanID {
+	return le.spanID
 }
 
-func (le *LogEvent) ScrubSecretSet(secrets model.SecretSet) {
-	for _, s := range secrets {
-		le.ScrubSecret(s)
-	}
+func (le LogAction) String() string {
+	return fmt.Sprintf("manifest: %s, spanID: %s, msg: %q", le.mn, le.spanID, le.msg)
 }
 
-func NewLogEvent(mn model.ManifestName, b []byte) LogEvent {
-	return LogEvent{
+func NewLogAction(mn model.ManifestName, spanID logstore.SpanID, level logger.Level, fields logger.Fields, b []byte) LogAction {
+	return LogAction{
 		mn:        mn,
+		spanID:    spanID,
+		level:     level,
 		timestamp: time.Now(),
 		msg:       append([]byte{}, b...),
+		fields:    fields,
 	}
 }
 
-func NewGlobalLogEvent(b []byte) LogEvent {
-	return LogEvent{
+func NewGlobalLogAction(level logger.Level, b []byte) LogAction {
+	return LogAction{
 		mn:        "",
+		spanID:    "",
+		level:     level,
 		timestamp: time.Now(),
 		msg:       append([]byte{}, b...),
 	}
@@ -99,8 +98,10 @@ func (kEvt K8sEventAction) ToLogAction(mn model.ManifestName) LogAction {
 	msg := fmt.Sprintf("[K8s EVENT: %s] %s\n",
 		objRefHumanReadable(kEvt.Event.InvolvedObject), kEvt.Event.Message)
 
-	return LogEvent{
+	return LogAction{
 		mn:        mn,
+		spanID:    logstore.SpanID(fmt.Sprintf("events:%s", mn)),
+		level:     logger.InfoLvl,
 		timestamp: kEvt.Event.LastTimestamp.Time,
 		msg:       []byte(msg),
 	}
@@ -114,11 +115,11 @@ func objRefHumanReadable(obj v1.ObjectReference) string {
 	return s
 }
 
-type AnalyticsOptAction struct {
+type AnalyticsUserOptAction struct {
 	Opt analytics.Opt
 }
 
-func (AnalyticsOptAction) Action() {}
+func (AnalyticsUserOptAction) Action() {}
 
 type AnalyticsNudgeSurfacedAction struct{}
 
@@ -152,3 +153,9 @@ func NewPodResetRestartsAction(podID k8s.PodID, mn model.ManifestName, visibleRe
 }
 
 func (PodResetRestartsAction) Action() {}
+
+type PanicAction struct {
+	Err error
+}
+
+func (PanicAction) Action() {}

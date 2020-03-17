@@ -1,30 +1,24 @@
 import { Alert } from "./alerts"
+import { Facet } from "./facets"
+
+export enum SocketState {
+  Loading,
+  Reconnecting,
+  Closed,
+  Active,
+}
 
 export enum ResourceView {
   Log,
-  Preview,
   Alerts,
+  Facets,
+  Trace,
 }
 
 export enum TriggerMode {
   TriggerModeAuto,
-  TriggerModeManual,
-}
-
-export type Build = {
-  Error: {} | string | null
-  StartTime: string
-  Log: string
-  FinishTime: string
-  Edits: Array<string> | null
-  IsCrashRebuild: boolean
-  Warnings: Array<string> | null
-}
-
-export type TiltBuild = {
-  Version: string
-  Date: string
-  Dev: boolean
+  TriggerModeManualAfterInitial,
+  TriggerModeManualIncludingInitial,
 }
 
 // what is the status of the resource in the cluster
@@ -32,80 +26,62 @@ export enum RuntimeStatus {
   Ok = "ok",
   Pending = "pending",
   Error = "error",
-  Unknown = "unknown",
+  NotApplicable = "not_applicable",
 }
 
 // What is the status of the resource with respect to Tilt
 export enum ResourceStatus {
-  BuildQueued, // in auto, if you have changed a file but an affected build hasn't started yet. In manual after you have clicked build, before it has started building
-  Building,
-  Error,
-  Warning,
-  Deploying,
-  Deployed, // defer to RuntimeStatus
+  Building, // Tilt is actively doing something (e.g., docker build or kubectl apply)
+  Pending, // not building, healthy, or unhealthy, but presumably on its way to one of those (e.g., queued to build, or ContainerCreating)
+  Healthy, // e.g., build succeeded and pod is running and healthy
+  Unhealthy, // e.g., last build failed, or CrashLoopBackOff
+  Warning, // e.g., an undismissed restart
+  None, // e.g., a manual build that has never executed
 }
 
-export type Resource = {
-  Name: string
-  CombinedLog: string
-  BuildHistory: Array<any>
-  CrashLog: string
-  CurrentBuild: any
-  DirectoriesWatched: Array<any>
-  Endpoints: Array<string>
-  PodID: string
-  IsTiltfile: boolean
-  LastDeployTime: string
-  PathsWatched: Array<string>
-  PendingBuildEdits: Array<string>
-  PendingBuildReason: number
-  PendingBuildSince: string
-  K8sResourceInfo?: K8sResourceInfo
-  DCResourceInfo?: DCResourceInfo
-  RuntimeStatus: string
-  TriggerMode: TriggerMode
-  HasPendingChanges: boolean
-  Alerts: Array<Alert>
-}
-export type K8sResourceInfo = {
-  PodName: string
-  PodCreationTime: string
-  PodUpdateStartTime: string
-  PodStatus: string
-  PodStatusMessage: string
-  PodRestarts: number
-  PodLog: string
-  Endpoints: Array<string>
-}
-export type DCResourceInfo = {
-  ConfigPaths: Array<string>
-  ContainerStatus: string
-  ContainerID: string
-  Log: string
-  StartTime: string
-}
-
-export type Snapshot = {
-  // input of snapshot_storage
-  Message: string
-  View: {
-    Resources: Array<Resource>
-    Log: string
-    LogTimestamps: boolean
-    SailEnabled: boolean
-    SailURL: string
-    NeedsAnalyticsNudge: boolean
-    RunningTiltBuild: TiltBuild
-    LatestTiltBuild: TiltBuild
-    FeatureFlags: { [featureFlag: string]: boolean }
-  } | null
-  IsSidebarClosed: boolean
-  SnapshotLink: string
-  showSnapshotModal: boolean
+export type SnapshotHighlight = {
+  beginningLogID: string
+  endingLogID: string
+  text: string
 }
 
 export enum ShowFatalErrorModal {
   Default,
   Show,
   Hide,
+}
+
+export type Snapshot = {
+  view: Proto.webviewView
+  isSidebarClosed: boolean
+  path?: string
+  snapshotHighlight?: SnapshotHighlight | null
+}
+
+// A plaintext representation of a line of the log,
+// with metadata to render it in isolation.
+//
+// The metadata should be stored as primitive fields
+// so that React's default caching behavior will kick in.
+export type LogLine = {
+  // We assume that 'text' does not contain a newline
+  text: string
+  manifestName: string
+  level: string
+  buildEvent?: string
+  spanId: string
+}
+
+// Display data about the current log trace.
+export type LogTrace = {
+  url: string
+  index: number
+}
+
+// Display data that lets us navigate between log traces.
+export type LogTraceNav = {
+  count: number // The total number of traces
+  current: LogTrace
+  prev?: LogTrace
+  next?: LogTrace
 }

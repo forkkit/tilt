@@ -8,18 +8,25 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/windmilleng/tilt/internal/testutils"
+
+	"github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/windmilleng/wmclient/pkg/analytics"
 
 	tiltanalytics "github.com/windmilleng/tilt/internal/analytics"
 	"github.com/windmilleng/tilt/internal/cloud"
+	"github.com/windmilleng/tilt/internal/cloud/cloudurl"
 	"github.com/windmilleng/tilt/internal/hud/server"
 	"github.com/windmilleng/tilt/internal/store"
 	"github.com/windmilleng/tilt/pkg/assets"
 	"github.com/windmilleng/tilt/pkg/model"
+	proto_webview "github.com/windmilleng/tilt/pkg/webview"
 )
 
 func TestHandleAnalyticsEmptyRequest(t *testing.T) {
@@ -131,7 +138,7 @@ func TestHandleAnalyticsErrorsIfNotIncr(t *testing.T) {
 func TestHandleAnalyticsOptIn(t *testing.T) {
 	f := newTestFixture(t)
 
-	err := f.ta.SetOpt(analytics.OptDefault)
+	err := f.ta.SetUserOpt(analytics.OptDefault)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,14 +160,13 @@ func TestHandleAnalyticsOptIn(t *testing.T) {
 			status, http.StatusOK)
 	}
 
-	action := store.WaitForAction(t, reflect.TypeOf(store.AnalyticsOptAction{}), f.getActions)
-	assert.Equal(t, store.AnalyticsOptAction{Opt: analytics.OptIn}, action)
+	action := store.WaitForAction(t, reflect.TypeOf(store.AnalyticsUserOptAction{}), f.getActions)
+	assert.Equal(t, store.AnalyticsUserOptAction{Opt: analytics.OptIn}, action)
 
 	f.a.Flush(time.Millisecond)
 
 	assert.Equal(t, []analytics.CountEvent{{
 		Name: "analytics.opt.in",
-		Tags: map[string]string{"version": "v0.0.0"},
 		N:    1,
 	}}, f.a.Counts)
 }
@@ -221,7 +227,7 @@ func TestHandleTriggerReturnsError(t *testing.T) {
 
 	handler.ServeHTTP(rr, req)
 
-	// Expect maybeSendToTriggerQueue to fail: make sure we reply to the HTTP request
+	// Expect SendToTriggerQueue to fail: make sure we reply to the HTTP request
 	// with an error when this happens
 	if status := rr.Code; status != http.StatusBadRequest {
 		t.Errorf("handler returned wrong status code: got %v want %v",
@@ -295,20 +301,20 @@ func TestHandleTriggerMalformedPayload(t *testing.T) {
 	assert.Contains(t, rr.Body.String(), "error parsing JSON")
 }
 
-func TestMaybeSendToTriggerQueue(t *testing.T) {
+func TestSendToTriggerQueue_manualManifest(t *testing.T) {
 	f := newTestFixture(t)
 
 	mt := store.ManifestTarget{
 		Manifest: model.Manifest{
 			Name:        "foobar",
-			TriggerMode: model.TriggerModeManual,
+			TriggerMode: model.TriggerModeManualAfterInitial,
 		},
 	}
 	state := f.st.LockMutableStateForTesting()
 	state.UpsertManifestTarget(&mt)
 	f.st.UnlockMutableState()
 
-	err := server.MaybeSendToTriggerQueue(f.st, "foobar")
+	err := server.SendToTriggerQueue(f.st, "foobar", model.BuildReasonFlagTriggerWeb)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,18 +325,10 @@ func TestMaybeSendToTriggerQueue(t *testing.T) {
 		t.Fatalf("Action was not of type 'AppendToTriggerQueueAction': %+v", action)
 	}
 	assert.Equal(t, "foobar", action.Name.String())
+	assert.Equal(t, model.BuildReasonFlagTriggerWeb, action.Reason)
 }
 
-func TestMaybeSendToTriggerQueue_noManifestWithName(t *testing.T) {
-	f := newTestFixture(t)
-
-	err := server.MaybeSendToTriggerQueue(f.st, "foobar")
-
-	assert.EqualError(t, err, "no manifest found with name 'foobar'")
-	store.AssertNoActionOfType(t, reflect.TypeOf(server.AppendToTriggerQueueAction{}), f.getActions)
-}
-
-func TestMaybeSendToTriggerQueue_notManualManifest(t *testing.T) {
+func TestSendToTriggerQueue_automaticManifest(t *testing.T) {
 	f := newTestFixture(t)
 
 	mt := store.ManifestTarget{
@@ -343,9 +341,25 @@ func TestMaybeSendToTriggerQueue_notManualManifest(t *testing.T) {
 	state.UpsertManifestTarget(&mt)
 	f.st.UnlockMutableState()
 
-	err := server.MaybeSendToTriggerQueue(f.st, "foobar")
+	err := server.SendToTriggerQueue(f.st, "foobar", model.BuildReasonFlagTriggerWeb)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	assert.EqualError(t, err, "can only trigger updates for manifests of TriggerModeManual")
+	a := store.WaitForAction(t, reflect.TypeOf(server.AppendToTriggerQueueAction{}), f.getActions)
+	action, ok := a.(server.AppendToTriggerQueueAction)
+	if !ok {
+		t.Fatalf("Action was not of type 'AppendToTriggerQueueAction': %+v", action)
+	}
+	assert.Equal(t, "foobar", action.Name.String())
+}
+
+func TestSendToTriggerQueue_noManifestWithName(t *testing.T) {
+	f := newTestFixture(t)
+
+	err := server.SendToTriggerQueue(f.st, "foobar", model.BuildReasonFlagTriggerWeb)
+
+	assert.EqualError(t, err, "no manifest found with name 'foobar'")
 	store.AssertNoActionOfType(t, reflect.TypeOf(server.AppendToTriggerQueueAction{}), f.getActions)
 }
 
@@ -367,43 +381,89 @@ func TestHandleNewSnapshot(t *testing.T) {
 
 	handler.ServeHTTP(rr, req)
 
-	if status := rr.Code; status != http.StatusOK {
-		t.Errorf("handler returned wrong status code: got %v want %v",
-			status, http.StatusOK)
+	require.Equal(t, http.StatusOK, rr.Code,
+		"handler returned wrong status code: got %v want %v", rr.Code, http.StatusOK)
+	require.Contains(t, rr.Body.String(), "https://nonexistent.example.com/snapshot/aaaaa")
+
+	lastReq := f.snapshotHTTP.lastReq
+	if assert.NotNil(t, lastReq) {
+		var snapshot proto_webview.Snapshot
+		jspb := &runtime.JSONPb{OrigName: false, EmitDefaults: true}
+		decoder := jspb.NewDecoder(lastReq.Body)
+		err := decoder.Decode(&snapshot)
+		require.NoError(t, err)
+		assert.Equal(t, "0.10.13", snapshot.View.RunningTiltBuild.Version)
+		assert.Equal(t, "43", snapshot.SnapshotHighlight.BeginningLogID)
 	}
-	assert.Contains(t, rr.Body.String(), "https://nonexistent.example.com/snapshot/aaaaa")
+}
+
+func TestSetTiltfileArgs(t *testing.T) {
+	f := newTestFixture(t)
+
+	json := `["--foo", "bar", "as df"]`
+	req, err := http.NewRequest("POST", "/api/set_tiltfile_args", strings.NewReader(json))
+	require.NoError(t, err)
+
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	handler := http.HandlerFunc(f.serv.HandleSetTiltfileArgs)
+
+	handler.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	a := store.WaitForAction(t, reflect.TypeOf(server.SetTiltfileArgsAction{}), f.getActions)
+	action, ok := a.(server.SetTiltfileArgsAction)
+	if !ok {
+		t.Fatalf("Action was not of type '%T': %+v", server.SetTiltfileArgsAction{}, action)
+	}
+	assert.Equal(t, []string{"--foo", "bar", "as df"}, action.Args)
 }
 
 type serverFixture struct {
-	t          *testing.T
-	serv       *server.HeadsUpServer
-	a          *analytics.MemoryAnalytics
-	ta         *tiltanalytics.TiltAnalytics
-	st         *store.Store
-	getActions func() []store.Action
+	t            *testing.T
+	serv         *server.HeadsUpServer
+	a            *analytics.MemoryAnalytics
+	ta           *tiltanalytics.TiltAnalytics
+	st           *store.Store
+	getActions   func() []store.Action
+	snapshotHTTP *fakeHTTPClient
 }
 
 func newTestFixture(t *testing.T) *serverFixture {
 	st, getActions := store.NewStoreForTesting()
-	go st.Loop(context.Background())
-	a := analytics.NewMemoryAnalytics()
-	a, ta := tiltanalytics.NewMemoryTiltAnalyticsForTest(tiltanalytics.NullOpter{})
-	httpClient := fakeHttpClient{}
-	serv := server.ProvideHeadsUpServer(st, assets.NewFakeServer(), ta, httpClient, cloud.Address("nonexistent.example.com"))
+	go func() {
+		err := st.Loop(context.Background())
+		testutils.FailOnNonCanceledErr(t, err, "store.Loop failed")
+	}()
+	opter := tiltanalytics.NewFakeOpter(analytics.OptIn)
+	a, ta := tiltanalytics.NewMemoryTiltAnalyticsForTest(opter)
+	snapshotHTTP := &fakeHTTPClient{}
+	addr := cloudurl.Address("nonexistent.example.com")
+	uploader := cloud.NewSnapshotUploader(snapshotHTTP, addr)
+	serv, err := server.ProvideHeadsUpServer(context.Background(), st, assets.NewFakeServer(), ta, uploader)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	return &serverFixture{
-		t:          t,
-		serv:       serv,
-		a:          a,
-		ta:         ta,
-		st:         st,
-		getActions: getActions,
+		t:            t,
+		serv:         serv,
+		a:            a,
+		ta:           ta,
+		st:           st,
+		getActions:   getActions,
+		snapshotHTTP: snapshotHTTP,
 	}
 }
 
-type fakeHttpClient struct{}
+type fakeHTTPClient struct {
+	lastReq *http.Request
+}
 
-func (f fakeHttpClient) Do(req *http.Request) (*http.Response, error) {
+func (f *fakeHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	f.lastReq = req
+
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Body:       ioutil.NopCloser(bytes.NewReader([]byte(`{"ID":"aaaaa"}`))),

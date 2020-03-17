@@ -74,7 +74,7 @@ func InjectImageDigest(entity K8sEntity, selector container.RefSelector, injectR
 		}
 	}
 
-	entity, r, err = injectImageDigestInUnstructured(entity, injectRef)
+	entity, r, err = injectImageDigestInUnstructured(entity, selector, injectRef)
 	if err != nil {
 		return K8sEntity{}, false, err
 	}
@@ -99,7 +99,7 @@ func injectImageDigestInContainers(entity K8sEntity, selector container.RefSelec
 		}
 
 		if selector.Matches(existingRef) {
-			c.Image = injectRef.String()
+			c.Image = container.FamiliarString(injectRef)
 			c.ImagePullPolicy = policy
 			replaced = true
 		}
@@ -122,7 +122,7 @@ func injectImageDigestInEnvVars(entity K8sEntity, selector container.RefSelector
 		}
 
 		if selector.Matches(existingRef) {
-			envVar.Value = injectRef.String()
+			envVar.Value = container.FamiliarString(injectRef)
 			replaced = true
 		}
 	}
@@ -130,12 +130,12 @@ func injectImageDigestInEnvVars(entity K8sEntity, selector container.RefSelector
 	return entity, replaced, nil
 }
 
-func injectImageInUnstructuredInterface(ui interface{}, injectRef reference.Named) (interface{}, bool) {
+func injectImageInUnstructuredInterface(ui interface{}, selector container.RefSelector, injectRef reference.Named) (interface{}, bool) {
 	switch x := ui.(type) {
 	case map[string]interface{}:
 		replaced := false
 		for k, v := range x {
-			newV, r := injectImageInUnstructuredInterface(v, injectRef)
+			newV, r := injectImageInUnstructuredInterface(v, selector, injectRef)
 			x[k] = newV
 			if r {
 				replaced = true
@@ -145,7 +145,7 @@ func injectImageInUnstructuredInterface(ui interface{}, injectRef reference.Name
 	case []interface{}:
 		replaced := false
 		for i, v := range x {
-			newV, r := injectImageInUnstructuredInterface(v, injectRef)
+			newV, r := injectImageInUnstructuredInterface(v, selector, injectRef)
 			x[i] = newV
 			if r {
 				replaced = true
@@ -154,8 +154,8 @@ func injectImageInUnstructuredInterface(ui interface{}, injectRef reference.Name
 		return x, replaced
 	case string:
 		ref, err := container.ParseNamed(x)
-		if err == nil && ref.Name() == injectRef.Name() {
-			return injectRef.String(), true
+		if err == nil && selector.Matches(ref) {
+			return container.FamiliarString(injectRef), true
 		} else {
 			return x, false
 		}
@@ -164,13 +164,13 @@ func injectImageInUnstructuredInterface(ui interface{}, injectRef reference.Name
 	}
 }
 
-func injectImageDigestInUnstructured(entity K8sEntity, injectRef reference.Named) (K8sEntity, bool, error) {
+func injectImageDigestInUnstructured(entity K8sEntity, selector container.RefSelector, injectRef reference.Named) (K8sEntity, bool, error) {
 	u, ok := entity.Obj.(runtime.Unstructured)
 	if !ok {
 		return entity, false, nil
 	}
 
-	n, replaced := injectImageInUnstructuredInterface(u.UnstructuredContent(), injectRef)
+	n, replaced := injectImageInUnstructuredInterface(u.UnstructuredContent(), selector, injectRef)
 
 	u.SetUnstructuredContent(n.(map[string]interface{}))
 
@@ -178,11 +178,11 @@ func injectImageDigestInUnstructured(entity K8sEntity, injectRef reference.Named
 	return entity, replaced, nil
 }
 
-func InjectCommand(entity K8sEntity, ref reference.Named, cmd model.Cmd) (K8sEntity, error) {
+func InjectCommandAndArgs(entity K8sEntity, ref reference.Named, cmd model.Cmd, args model.OverrideArgs) (K8sEntity, error) {
 	entity = entity.DeepCopy()
 
 	selector := container.NewRefSelector(ref)
-	e, injected, err := injectCommandInContainers(entity, selector, cmd)
+	e, injected, err := injectCommandInContainers(entity, selector, cmd, args)
 	if err != nil {
 		return e, err
 	}
@@ -191,13 +191,13 @@ func InjectCommand(entity K8sEntity, ref reference.Named, cmd model.Cmd) (K8sEnt
 		// k8s yaml `container` block). This means we don't support injecting commands into CRDs.
 		return e, fmt.Errorf("could not inject command %v into entity: %s. No container found matching ref: %s. "+
 			"Note: command overrides only supported on containers with images, not on CRDs",
-			cmd.Argv, entity.Name(), ref.String())
+			cmd.Argv, entity.Name(), container.FamiliarString(ref))
 	}
 
 	return e, nil
 }
 
-func injectCommandInContainers(entity K8sEntity, selector container.RefSelector, cmd model.Cmd) (K8sEntity, bool, error) {
+func injectCommandInContainers(entity K8sEntity, selector container.RefSelector, cmd model.Cmd, args model.OverrideArgs) (K8sEntity, bool, error) {
 	var injected bool
 	containers, err := extractContainers(&entity)
 	if err != nil {
@@ -211,8 +211,16 @@ func injectCommandInContainers(entity K8sEntity, selector container.RefSelector,
 		}
 
 		if selector.Matches(existingRef) {
-			c.Command = cmd.Argv
-			c.Args = nil // clear the "args" param.
+			// The override rules of entrypoint and Command and Args are surprisingly complex!
+			// See this github thread:
+			// https://github.com/windmilleng/tilt/issues/2918
+			if !cmd.Empty() {
+				c.Command = cmd.Argv
+			}
+
+			if args.ShouldOverride {
+				c.Args = args.Args
+			}
 
 			injected = true
 		}

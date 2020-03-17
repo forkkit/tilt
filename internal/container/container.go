@@ -34,6 +34,18 @@ func ParseNamed(s string) (reference.Named, error) {
 	return reference.ParseNormalizedNamed(s)
 }
 
+func ParseNamedMulti(strs []string) ([]reference.Named, error) {
+	var err error
+	res := make([]reference.Named, len(strs))
+	for i, s := range strs {
+		res[i], err = reference.ParseNormalizedNamed(s)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return res, nil
+}
+
 func ParseNamedTagged(s string) (reference.NamedTagged, error) {
 	ref, err := reference.ParseNormalizedNamed(s)
 	if err != nil {
@@ -63,20 +75,12 @@ func MustParseNamed(s string) reference.Named {
 	return n
 }
 
-func NormalizeRef(ref string) (string, error) {
-	named, err := ParseNamed(ref)
-	if err != nil {
-		return "", err
-	}
-	return named.String(), nil
-}
-
-func MustNormalizeRef(ref string) string {
-	normalized, err := NormalizeRef(ref)
+func MustWithTag(name reference.Named, tag string) reference.NamedTagged {
+	nt, err := reference.WithTag(name, tag)
 	if err != nil {
 		panic(err)
 	}
-	return normalized
+	return nt
 }
 
 func NewIDSet(ids ...ID) map[ID]bool {

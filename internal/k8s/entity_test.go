@@ -5,10 +5,14 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/windmilleng/tilt/internal/k8s/testyaml"
+	"github.com/windmilleng/tilt/internal/kustomize"
 )
 
 func TestTypedPodGVK(t *testing.T) {
@@ -133,7 +137,7 @@ func TestFilter(t *testing.T) {
 	returnErr := func(e K8sEntity) (bool, error) {
 		return false, fmt.Errorf("omgwtfbbq")
 	}
-	popped, rest, err = Filter(entities, returnErr)
+	_, _, err = Filter(entities, returnErr)
 	if assert.Error(t, err, "expected Filter to propagate err from test func") {
 		assert.Equal(t, err.Error(), "omgwtfbbq")
 	}
@@ -189,60 +193,118 @@ func TestHasKind(t *testing.T) {
 	assert.True(t, svc.HasKind("service"))
 }
 
-func TestEntitiesWithDependenciesAndRest(t *testing.T) {
-	eDeploy := mustParseYAML(t, testyaml.DoggosDeploymentYaml)[0]
-	eService := mustParseYAML(t, testyaml.DoggosServiceYaml)[0]
-	eCRD := mustParseYAML(t, testyaml.CRDYAML)[0]
-	eNamespace := mustParseYAML(t, testyaml.MyNamespaceYAML)[0]
-
+func TestSortEntities(t *testing.T) {
 	for _, test := range []struct {
-		name                   string
-		input                  []K8sEntity
-		expectedWithDependents []K8sEntity
-		expectedRest           []K8sEntity
+		name              string
+		inputKindOrder    []string
+		expectedKindOrder []string
 	}{
-		{"one namespace",
-			[]K8sEntity{eDeploy, eNamespace, eService},
-			[]K8sEntity{eNamespace},
-			[]K8sEntity{eDeploy, eService},
+		{"all explicitly sorted",
+			[]string{"Deployment", "Namespace", "Service"},
+			[]string{"Namespace", "Service", "Deployment"},
 		},
-		{"one crd",
-			[]K8sEntity{eDeploy, eCRD, eService},
-			[]K8sEntity{eCRD},
-			[]K8sEntity{eDeploy, eService},
+		{"preserve order if not explicitly sorted",
+			[]string{"custom1", "custom2", "custom3"},
+			[]string{"custom1", "custom2", "custom3"},
 		},
-		{"namespace and crd",
-			[]K8sEntity{eDeploy, eCRD, eService, eNamespace},
-			[]K8sEntity{eNamespace, eCRD},
-			[]K8sEntity{eDeploy, eService},
+		{"preserve order if not explicitly sorted, also sort others",
+			[]string{"custom1", "custom2", "Secret", "custom3", "ConfigMap"},
+			[]string{"ConfigMap", "Secret", "custom1", "custom2", "custom3"},
 		},
-		{"namespace and crd preserves order of rest",
-			[]K8sEntity{eService, eCRD, eDeploy, eNamespace},
-			[]K8sEntity{eNamespace, eCRD},
-			[]K8sEntity{eService, eDeploy},
+		{"pod and job not sorted",
+			[]string{"Pod", "Job", "Job", "Pod"},
+			[]string{"Pod", "Job", "Job", "Pod"},
 		},
-		{"none with dependents",
-			[]K8sEntity{eDeploy, eService},
-			nil,
-			[]K8sEntity{eDeploy, eService},
-		},
-		{"only with dependents",
-			[]K8sEntity{eNamespace, eCRD},
-			[]K8sEntity{eNamespace, eCRD},
-			nil,
-		},
-		{"namespace first",
-			[]K8sEntity{eCRD, eNamespace},
-			[]K8sEntity{eNamespace, eCRD},
-			nil,
+		{"preserve order if not explicitly sorted if many elements",
+			// sort.Sort started by comparing input[0] and input[6], which resulted in unexpected order.
+			// (didn't preserve order of "Job" vs. "Pod"). Make sure that doesn't happen anymore.
+			[]string{"Job", "PersistentVolumeClaim", "Service", "Pod", "ConfigMap", "PersistentVolume", "StatefulSet"},
+			[]string{"PersistentVolume", "PersistentVolumeClaim", "ConfigMap", "Service", "StatefulSet", "Job", "Pod"},
 		},
 	} {
 		t.Run(string(test.name), func(t *testing.T) {
-			withDependents, rest := EntitiesWithDependentsAndRest(test.input)
-			assert.Equal(t, test.expectedWithDependents, withDependents)
-			assert.Equal(t, test.expectedRest, rest)
+			input := entitiesWithKinds(test.inputKindOrder)
+			sorted := SortedEntities(input)
+			assertKindOrder(t, test.expectedKindOrder, sorted, "sorted entities")
 		})
 	}
+}
+
+func TestMutableAndImmutableEntities(t *testing.T) {
+	for _, test := range []struct {
+		name                       string
+		inputKindOrder             []string
+		expectedMutableKindOrder   []string
+		expectedImmutableKindOrder []string
+	}{
+		{"only mutable",
+			[]string{"Deployment", "Namespace", "Service"},
+			[]string{"Deployment", "Namespace", "Service"},
+			[]string{},
+		},
+		{"only immutable",
+			[]string{"Job", "Pod"},
+			[]string{},
+			[]string{"Job", "Pod"},
+		},
+		{"mutable and immutable interspersed",
+			[]string{"Deployment", "Job", "Namespace", "Pod", "Service"},
+			[]string{"Deployment", "Namespace", "Service"},
+			[]string{"Job", "Pod"},
+		},
+		{"no explicitly sorted kinds are immutable",
+			// If any kinds in the explicit sort list are also immutable, things will get weird
+			kustomize.OrderFirst,
+			kustomize.OrderFirst,
+			[]string{},
+		},
+	} {
+		t.Run(string(test.name), func(t *testing.T) {
+			input := entitiesWithKinds(test.inputKindOrder)
+			mutable, immutable := MutableAndImmutableEntities(input)
+			assertKindOrder(t, test.expectedMutableKindOrder, mutable, "mutable entities")
+			assertKindOrder(t, test.expectedImmutableKindOrder, immutable, "immutable entities")
+		})
+	}
+}
+
+func entitiesWithKinds(kinds []string) []K8sEntity {
+	entities := make([]K8sEntity, len(kinds))
+	for i, k := range kinds {
+		entities[i] = entityWithKind(k)
+	}
+	return entities
+}
+
+func entityWithKind(kind string) K8sEntity {
+	return K8sEntity{
+		Obj: fakeObject{
+			kind: fakeKind(kind),
+		},
+	}
+}
+
+type fakeObject struct {
+	kind fakeKind
+}
+
+func (obj fakeObject) GetObjectKind() schema.ObjectKind { return obj.kind }
+func (obj fakeObject) DeepCopyObject() runtime.Object   { return obj }
+
+type fakeKind string
+
+func (k fakeKind) SetGroupVersionKind(gvk schema.GroupVersionKind) { panic("unsupported") }
+func (k fakeKind) GroupVersionKind() schema.GroupVersionKind {
+	return schema.GroupVersionKind{Kind: string(k)}
+}
+
+func assertKindOrder(t *testing.T, expectedKinds []string, actual []K8sEntity, msg string) {
+	require.Len(t, actual, len(expectedKinds), "len(expectedKinds) != len(actualKinds): "+msg)
+	actualKinds := make([]string, len(expectedKinds))
+	for i, e := range actual {
+		actualKinds[i] = e.GVK().Kind
+	}
+	assert.Equal(t, expectedKinds, actualKinds, msg)
 }
 
 func parseYAMLFromStrings(yaml ...string) ([]K8sEntity, error) {

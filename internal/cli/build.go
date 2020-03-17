@@ -19,8 +19,9 @@ import (
 // For distributed binaries, version is automatically baked
 // into the binary with goreleaser. If this doesn't get updated
 // on every release, it's often not that big a deal.
-const devVersion = "0.10.13"
+const devVersion = "0.12.8"
 
+var commitSHA string
 var globalTiltInfo model.TiltBuild
 
 func SetTiltInfo(info model.TiltBuild) {
@@ -72,9 +73,10 @@ func defaultBuildDate() string {
 // Returns a build datestamp in the format 2018-08-30
 func defaultTiltInfo() model.TiltBuild {
 	return model.TiltBuild{
-		Date:    defaultBuildDate(),
-		Version: devVersion,
-		Dev:     true,
+		Date:      defaultBuildDate(),
+		Version:   devVersion,
+		CommitSHA: commitSHA,
+		Dev:       true,
 	}
 }
 

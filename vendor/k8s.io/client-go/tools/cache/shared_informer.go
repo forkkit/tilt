@@ -148,6 +148,8 @@ type SharedInformer interface {
 	// store. The value returned is not synchronized with access to the underlying store and is not
 	// thread-safe.
 	LastSyncResourceVersion() string
+
+	SetDropWatchHandler(handler DropWatchHandler) error
 }
 
 // SharedIndexInformer provides add and get Indexers ability based on SharedInformer.
@@ -209,7 +211,7 @@ func WaitForNamedCacheSync(controllerName string, stopCh <-chan struct{}, cacheS
 // if the controller should shutdown
 // callers should prefer WaitForNamedCacheSync()
 func WaitForCacheSync(stopCh <-chan struct{}, cacheSyncs ...InformerSynced) bool {
-	err := wait.PollUntil(syncedPollPeriod,
+	err := wait.PollImmediateUntil(syncedPollPeriod,
 		func() (bool, error) {
 			for _, syncFunc := range cacheSyncs {
 				if !syncFunc() {
@@ -255,6 +257,8 @@ type sharedIndexInformer struct {
 	// blockDeltas gives a way to stop all event distribution so that a late event handler
 	// can safely join the shared informer.
 	blockDeltas sync.Mutex
+
+	dropWatchHandler DropWatchHandler
 }
 
 // dummyController hides the fact that a SharedInformer is different from a dedicated one
@@ -290,6 +294,18 @@ type deleteNotification struct {
 	oldObj interface{}
 }
 
+func (s *sharedIndexInformer) SetDropWatchHandler(handler DropWatchHandler) error {
+	s.startedLock.Lock()
+	defer s.startedLock.Unlock()
+
+	if s.started {
+		return fmt.Errorf("informer has already started")
+	}
+
+	s.dropWatchHandler = handler
+	return nil
+}
+
 func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
 
@@ -303,7 +319,8 @@ func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
 		RetryOnError:     false,
 		ShouldResync:     s.processor.shouldResync,
 
-		Process: s.HandleDeltas,
+		Process:          s.HandleDeltas,
+		DropWatchHandler: s.dropWatchHandler,
 	}
 
 	func() {

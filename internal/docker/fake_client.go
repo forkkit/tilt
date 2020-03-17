@@ -8,8 +8,11 @@ import (
 	"sort"
 	"time"
 
+	"github.com/docker/go-units"
+
 	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/filters"
 
 	"github.com/windmilleng/tilt/internal/container"
 	"github.com/windmilleng/tilt/pkg/model"
@@ -28,6 +31,15 @@ const ExampleBuildOutputV1_23 = `{"stream":"Run 1/1 : FROM alpine"}
 	{"stream":"\n"}
 	{"stream":" ---\u003e 11cd0b38bc3c\n"}
 	{"stream":"Successfully built 11cd0b38bc3c\n"}
+	{"stream":"Successfully tagged hi:latest\n"}
+`
+
+// same as ExampleBuildOutput1 but with a different digest
+const ExampleBuildOutput2 = `{"stream":"Run 1/1 : FROM alpine"}
+	{"stream":"\n"}
+	{"stream":" ---\u003e 20372c132963\n"}
+	{"aux":{"ID":"sha256:20372c132963eb958ffb2f9bd70be3fb317ce7d255c8a4c3f4af20372c132963"}}
+	{"stream":"Successfully built 20372c132963\n"}
 	{"stream":"Successfully tagged hi:latest\n"}
 `
 
@@ -79,6 +91,7 @@ type FakeClient struct {
 	BuildErrorToThrow error // next call to Build will throw this err (after which we clear the error)
 
 	ImageListCount int
+	ImageListOpts  []types.ImageListOptions
 
 	TagCount  int
 	TagSource string
@@ -99,6 +112,14 @@ type FakeClient struct {
 	Images            map[string]types.ImageInspect
 	Orchestrator      model.Orchestrator
 	CheckConnectedErr error
+
+	ThrowNewVersionError   bool
+	BuildCachePruneErr     error
+	BuildCachePruneOpts    types.BuildCachePruneOptions
+	BuildCachesPruned      []string
+	ContainersPruneErr     error
+	ContainersPruneFilters filters.Args
+	ContainersPruned       []string
 }
 
 func NewFakeClient() *FakeClient {
@@ -222,6 +243,7 @@ func (c *FakeClient) ImageInspectWithRaw(ctx context.Context, imageID string) (t
 }
 
 func (c *FakeClient) ImageList(ctx context.Context, options types.ImageListOptions) ([]types.ImageSummary, error) {
+	c.ImageListOpts = append(c.ImageListOpts, options)
 	summaries := make([]types.ImageSummary, c.ImageListCount)
 	for i := range summaries {
 		summaries[i] = types.ImageSummary{
@@ -235,7 +257,55 @@ func (c *FakeClient) ImageList(ctx context.Context, options types.ImageListOptio
 func (c *FakeClient) ImageRemove(ctx context.Context, imageID string, options types.ImageRemoveOptions) ([]types.ImageDeleteResponseItem, error) {
 	c.RemovedImageIDs = append(c.RemovedImageIDs, imageID)
 	sort.Strings(c.RemovedImageIDs)
-	return nil, nil
+	return []types.ImageDeleteResponseItem{
+		types.ImageDeleteResponseItem{Deleted: imageID},
+	}, nil
+}
+
+func (c *FakeClient) NewVersionError(APIrequired, feature string) error {
+	if c.ThrowNewVersionError {
+		c.ThrowNewVersionError = false
+		return c.VersionError(APIrequired, feature)
+	}
+	return nil
+}
+
+func (c *FakeClient) VersionError(APIrequired, feature string) error {
+	return fmt.Errorf("%q requires API version %s, but the Docker daemon API version is... something else", feature, APIrequired)
+}
+
+func (c *FakeClient) BuildCachePrune(ctx context.Context, opts types.BuildCachePruneOptions) (*types.BuildCachePruneReport, error) {
+	if err := c.BuildCachePruneErr; err != nil {
+		c.BuildCachePruneErr = nil
+		return nil, err
+	}
+
+	c.BuildCachePruneOpts = types.BuildCachePruneOptions{
+		All:         opts.All,
+		KeepStorage: opts.KeepStorage,
+		Filters:     opts.Filters.Clone(),
+	}
+	report := &types.BuildCachePruneReport{
+		CachesDeleted:  c.BuildCachesPruned,
+		SpaceReclaimed: uint64(units.MB * len(c.BuildCachesPruned)), // 1MB per cache pruned
+	}
+	c.BuildCachesPruned = nil
+	return report, nil
+}
+
+func (c *FakeClient) ContainersPrune(ctx context.Context, pruneFilters filters.Args) (types.ContainersPruneReport, error) {
+	if err := c.ContainersPruneErr; err != nil {
+		c.ContainersPruneErr = nil
+		return types.ContainersPruneReport{}, err
+	}
+
+	c.ContainersPruneFilters = pruneFilters.Clone()
+	report := types.ContainersPruneReport{
+		ContainersDeleted: c.ContainersPruned,
+		SpaceReclaimed:    uint64(units.MB * len(c.ContainersPruned)), // 1MB per container pruned
+	}
+	c.ContainersPruned = nil
+	return report, nil
 }
 
 var _ Client = &FakeClient{}

@@ -14,7 +14,8 @@ type TestingStore struct {
 	state   *EngineState
 	stateMu sync.RWMutex
 
-	Actions []Action
+	actions   []Action
+	actionsMu sync.RWMutex
 }
 
 func NewTestingStore() *TestingStore {
@@ -27,6 +28,10 @@ func (s *TestingStore) SetState(state EngineState) {
 	s.state = &state
 }
 
+func (s *TestingStore) StateMutex() *sync.RWMutex {
+	return &s.stateMu
+}
+
 func (s *TestingStore) RLockState() EngineState {
 	s.stateMu.RLock()
 	return *(s.state)
@@ -37,7 +42,24 @@ func (s *TestingStore) RUnlockState() {
 }
 
 func (s *TestingStore) Dispatch(action Action) {
-	s.Actions = append(s.Actions, action)
+	s.actionsMu.Lock()
+	defer s.actionsMu.Unlock()
+
+	s.actions = append(s.actions, action)
+}
+
+func (s *TestingStore) ClearActions() {
+	s.actionsMu.Lock()
+	defer s.actionsMu.Unlock()
+
+	s.actions = nil
+}
+
+func (s *TestingStore) Actions() []Action {
+	s.actionsMu.RLock()
+	defer s.actionsMu.RUnlock()
+
+	return append([]Action{}, s.actions...)
 }
 
 // for use by tests (with a real channel-based store, NOT a TestingStore), to wait until

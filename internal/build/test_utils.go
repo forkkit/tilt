@@ -15,6 +15,7 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
+	"github.com/stretchr/testify/assert"
 
 	wmcontainer "github.com/windmilleng/tilt/internal/container"
 	"github.com/windmilleng/tilt/internal/docker"
@@ -34,7 +35,6 @@ type dockerBuildFixture struct {
 	dCli         *docker.Cli
 	fakeDocker   *docker.FakeClient
 	b            *dockerImageBuilder
-	cb           CacheBuilder
 	registry     *exec.Cmd
 	reaper       ImageReaper
 	containerIDs []wmcontainer.ID
@@ -51,11 +51,7 @@ func newDockerBuildFixture(t testing.TB) *dockerBuildFixture {
 	ctx, _, _ := testutils.CtxAndAnalyticsForTest()
 	env := k8s.EnvGKE
 
-	dEnv, err := docker.ProvideClusterEnv(ctx, env, wmcontainer.RuntimeDocker, minikube.FakeClient{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
+	dEnv := docker.ProvideClusterEnv(ctx, env, wmcontainer.RuntimeDocker, minikube.FakeClient{})
 	dCli := docker.NewDockerClient(ctx, docker.Env(dEnv))
 	_, ok := dCli.(*docker.Cli)
 	// If it wasn't an actual Docker client, it's an exploding client
@@ -75,7 +71,6 @@ func newDockerBuildFixture(t testing.TB) *dockerBuildFixture {
 		ctx:            ctx,
 		dCli:           dCli.(*docker.Cli),
 		b:              NewDockerImageBuilder(dCli, labels),
-		cb:             NewCacheBuilder(dCli),
 		reaper:         NewImageReaper(dCli),
 		ps:             ps,
 	}
@@ -96,7 +91,6 @@ func newFakeDockerBuildFixture(t testing.TB) *dockerBuildFixture {
 		ctx:            ctx,
 		fakeDocker:     dCli,
 		b:              NewDockerImageBuilder(dCli, labels),
-		cb:             NewCacheBuilder(dCli),
 		reaper:         NewImageReaper(dCli),
 		ps:             ps,
 	}
@@ -130,14 +124,10 @@ func (f *dockerBuildFixture) teardown() {
 	f.TempDirFixture.TearDown()
 }
 
-func (f *dockerBuildFixture) getNameFromTest() reference.Named {
+func (f *dockerBuildFixture) getNameFromTest() wmcontainer.RefSet {
 	x := fmt.Sprintf("windmill.build/%s", strings.ToLower(f.t.Name()))
-	name, err := reference.WithName(x)
-	if err != nil {
-		f.t.Fatal(err)
-	}
-
-	return name
+	sel := wmcontainer.MustParseSelector(x)
+	return wmcontainer.MustSimpleRefSet(sel)
 }
 
 func (f *dockerBuildFixture) startRegistry() {
@@ -172,6 +162,27 @@ func (f *dockerBuildFixture) assertImageNotExists(ref reference.NamedTagged) {
 	if err == nil || !client.IsErrNotFound(err) {
 		f.t.Errorf("Expected image %q to fail with ErrNotFound, got: %v", ref, err)
 	}
+}
+
+func (f *dockerBuildFixture) assertImageHasLabels(ref reference.Named, expected map[string]string) {
+	inspect, _, err := f.dCli.ImageInspectWithRaw(f.ctx, ref.String())
+	if err != nil {
+		f.t.Fatalf("error inspecting image %s: %v", ref.String(), err)
+	}
+
+	if inspect.Config == nil {
+		f.t.Fatalf("'inspect' result for image %s has nil config", ref.String())
+	}
+
+	actual := inspect.Config.Labels
+	for k, expectV := range expected {
+		actualV, ok := actual[k]
+		if assert.True(f.t, ok, "key %q not found in actual labels: %v", k, actual) {
+			assert.Equal(f.t, expectV, actualV, "actual label (%s = %s) did not match expected (%s = %s)",
+				k, actualV, k, expectV)
+		}
+	}
+
 }
 
 func (f *dockerBuildFixture) assertFilesInImage(ref reference.NamedTagged, expectedFiles []expectedFile) {

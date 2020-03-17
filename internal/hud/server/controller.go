@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -9,7 +11,6 @@ import (
 	"github.com/pkg/browser"
 	"github.com/pkg/errors"
 
-	"github.com/windmilleng/tilt/internal/network"
 	"github.com/windmilleng/tilt/internal/store"
 	"github.com/windmilleng/tilt/pkg/assets"
 	"github.com/windmilleng/tilt/pkg/model"
@@ -20,6 +21,7 @@ import (
 const reconnectDur = 2 * time.Second
 
 type HeadsUpServerController struct {
+	host        model.WebHost
 	port        model.WebPort
 	hudServer   *HeadsUpServer
 	assetServer assets.Server
@@ -29,8 +31,9 @@ type HeadsUpServerController struct {
 	noBrowser   model.NoBrowser
 }
 
-func ProvideHeadsUpServerController(port model.WebPort, hudServer *HeadsUpServer, assetServer assets.Server, webURL model.WebURL, noBrowser model.NoBrowser) *HeadsUpServerController {
+func ProvideHeadsUpServerController(host model.WebHost, port model.WebPort, hudServer *HeadsUpServer, assetServer assets.Server, webURL model.WebURL, noBrowser model.NoBrowser) *HeadsUpServerController {
 	return &HeadsUpServerController{
+		host:        host,
 		port:        port,
 		hudServer:   hudServer,
 		assetServer: assetServer,
@@ -100,7 +103,7 @@ func (s *HeadsUpServerController) OnChange(ctx context.Context, st store.RStore)
 		return
 	}
 
-	err := network.IsBindAddrFree(network.LocalhostBindAddr(int(s.port)))
+	l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", string(s.host), int(s.port)))
 	if err != nil {
 		st.Dispatch(
 			store.NewErrorAction(
@@ -109,7 +112,6 @@ func (s *HeadsUpServerController) OnChange(ctx context.Context, st store.RStore)
 	}
 
 	httpServer := &http.Server{
-		Addr:    network.LocalhostBindAddr(int(s.port)),
 		Handler: http.DefaultServeMux,
 	}
 	http.Handle("/", s.hudServer.Router())
@@ -127,7 +129,7 @@ func (s *HeadsUpServerController) OnChange(ctx context.Context, st store.RStore)
 	}()
 
 	go func() {
-		err := httpServer.ListenAndServe()
+		err := httpServer.Serve(l)
 		if err != nil && err != http.ErrServerClosed && ctx.Err() == nil {
 			st.Dispatch(store.NewErrorAction(err))
 		}

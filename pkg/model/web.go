@@ -10,9 +10,13 @@ import (
 
 type NoBrowser bool // flag for disabling automatic browser opening
 
-// Web version of the form vA.B.C, where A, B, and C are integers.
+// Web version of the form vA.B.C, where A, B, and C are integers
 // Used for fetching web assets
 type WebVersion string
+
+// Web version of the form aaaaaaa where a is a hex letter
+// Used for fetching web assets
+type WebSHA string
 
 // Mode for developing Tilt web UX.
 //
@@ -71,6 +75,7 @@ var emptyWebMode = WebMode("")
 var _ flag.Value = &emptyWebMode
 var _ pflag.Value = &emptyWebMode
 
+type WebHost string
 type WebPort int
 type WebDevPort int
 type WebURL url.URL

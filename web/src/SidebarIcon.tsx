@@ -1,138 +1,121 @@
 import React, { PureComponent } from "react"
-import { TriggerMode, RuntimeStatus, Build } from "./types"
-import { Color } from "./constants"
-import { ReactComponent as ManualSvg } from "./assets/svg/indicator-manual.svg"
-import { ReactComponent as ManualBuildingSvg } from "./assets/svg/indicator-manual-building.svg"
-import { ReactComponent as AutoSvg } from "./assets/svg/indicator-auto.svg"
-import { ReactComponent as AutoPendingSvg } from "./assets/svg/indicator-auto-pending.svg"
-import { ReactComponent as AutoBuildingSvg } from "./assets/svg/indicator-auto-building.svg"
+import { ResourceStatus } from "./types"
+import {
+  AnimDuration,
+  Color,
+  ColorAlpha,
+  ColorRGBA,
+  Font,
+  FontSize,
+  SizeUnit,
+} from "./style-helpers"
+import styled, { keyframes } from "styled-components"
+import { Width } from "./style-helpers"
+import { Link } from "react-router-dom"
 
 type SidebarIconProps = {
-  triggerMode: TriggerMode
-  status: RuntimeStatus
-  hasWarning: boolean
-  isBuilding: boolean
-  isDirty: boolean
-  lastBuild: Build | null
+  status: ResourceStatus
+  alertCount: number
 }
 
+// For testing
 export enum IconType {
-  DotAuto = "dotAuto",
-  DotAutoPending = "dotAutoPending",
-  DotAutoBuilding = "dotAutoBuilding",
-  DotManual = "dotManual",
-  DotManualPending = "dotManualPending",
-  DotManualBuilding = "dotManualBuilding",
+  StatusDefault = "default",
+  StatusPending = "pending",
+  StatusBuilding = "building",
 }
+
+let glowWhite = keyframes`
+  0% {
+    background-color: ${ColorRGBA(Color.white, ColorAlpha.translucent)};
+  }
+  50% {
+    background-color: ${ColorRGBA(Color.white, ColorAlpha.almostTransparent)};
+  }
+`
+
+let glowDark = keyframes`
+  0% {
+    background-color: ${ColorRGBA(Color.gray, ColorAlpha.translucent)};
+  }
+  50% {
+    background-color: ${ColorRGBA(Color.gray, ColorAlpha.almostTransparent)};
+  }
+`
+
+let SidebarIconRoot = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: ${Width.sidebarCollapsed * 0.7}px;
+  margin-right: ${Width.sidebarCollapsed * 0.3}px;
+  transition: background-color ${AnimDuration.default} linear,
+    opacity ${AnimDuration.default} linear;
+
+  &.isWarning {
+    background-color: ${Color.yellow};
+  }
+  &.isHealthy {
+    background-color: ${Color.green};
+  }
+  &.isUnhealthy {
+    background-color: ${Color.red};
+  }
+  &.isBuilding {
+    background-color: ${ColorRGBA(Color.white, ColorAlpha.translucent)};
+  }
+  .isSelected &.isBuilding {
+    background-color: ${ColorRGBA(Color.gray, ColorAlpha.translucent)};
+  }
+  &.isPending {
+    background-color: ${ColorRGBA(Color.white, ColorAlpha.translucent)};
+    animation: ${glowWhite} 2s linear infinite;
+  }
+  .isSelected &.isPending {
+    background-color: ${ColorRGBA(Color.gray, ColorAlpha.translucent)};
+    animation: ${glowDark} 2s linear infinite;
+  }
+  &.isNone {
+    background-color: ${ColorRGBA(Color.white, ColorAlpha.translucent)};
+  }
+  .isSelected &.isNone {
+    background-color: ${ColorRGBA(Color.gray, ColorAlpha.translucent)};
+  }
+`
+
+let AlertCount = styled.span`
+  font-family: ${Font.sansSerif};
+  font-size: ${FontSize.smallest};
+  color: ${Color.black};
+`
 
 export default class SidebarIcon extends PureComponent<SidebarIconProps> {
   render() {
-    let props = this.props
-    let fill = Color.green
-    let dirtyBuildWithError =
-      props.isDirty && props.lastBuild && props.lastBuild.Error
-
-    if (props.status === RuntimeStatus.Error) {
-      fill = Color.red
-    } else if (props.hasWarning) {
-      fill = Color.yellow
-    } else if (dirtyBuildWithError) {
-      fill = Color.red
-    }
-
-    if (props.triggerMode === TriggerMode.TriggerModeManual) {
-      return this.renderManual(fill)
-    }
-
-    return this.renderAuto(fill)
-  }
-
-  renderAuto(fill: Color) {
-    let props = this.props
-    if (props.isBuilding) {
-      return this.dotAutoBuilding()
-    }
-
-    if (props.status === RuntimeStatus.Pending) {
-      return this.dotAutoPending()
-    }
-
-    return this.dotAuto(fill)
-  }
-
-  renderManual(fill: Color) {
-    let props = this.props
-    if (props.isBuilding) {
-      return this.dotManualBuilding()
-    }
-
-    if (props.isDirty) {
-      return this.dotManual(fill)
-    }
-
-    if (props.status === RuntimeStatus.Pending) {
-      return this.dotManualPending()
-    }
-
-    return this.dotManual(fill)
-  }
-
-  dotAuto(fill: Color) {
-    return <AutoSvg className={`${IconType.DotAuto} auto`} fill={fill} />
-  }
-
-  dotAutoPending() {
-    let style = {
-      animation: "glow 1s linear infinite",
-    }
     return (
-      <AutoPendingSvg
-        className={`${IconType.DotAutoPending} auto`}
-        style={style}
-      />
+      <SidebarIconRoot className={`${this.status()}`}>
+        {this.props.alertCount > 0 ? (
+          <AlertCount>{this.props.alertCount}</AlertCount>
+        ) : (
+          <span>&nbsp;</span>
+        )}
+      </SidebarIconRoot>
     )
   }
 
-  dotAutoBuilding() {
-    let style = {
-      animation: "spin 1s linear infinite",
+  status() {
+    switch (this.props.status) {
+      case ResourceStatus.Building:
+        return "isBuilding"
+      case ResourceStatus.Pending:
+        return "isPending"
+      case ResourceStatus.Warning:
+        return "isWarning"
+      case ResourceStatus.Healthy:
+        return "isHealthy"
+      case ResourceStatus.Unhealthy:
+        return "isUnhealthy"
+      case ResourceStatus.None:
+        return "isNone"
     }
-    return (
-      <AutoBuildingSvg
-        className={`${IconType.DotAutoBuilding} auto`}
-        style={style}
-      />
-    )
-  }
-
-  dotManual(fill: Color) {
-    return <ManualSvg className={`${IconType.DotManual} manual`} fill={fill} />
-  }
-
-  dotManualPending() {
-    let style = {
-      animation: "glow 1s linear infinite",
-    }
-
-    return (
-      <ManualSvg
-        className={`${IconType.DotManualPending} manual`}
-        style={style}
-        fill={Color.white}
-      />
-    )
-  }
-
-  dotManualBuilding() {
-    let style = {
-      animation: "spin 1s linear infinite",
-    }
-
-    return (
-      <ManualBuildingSvg
-        className={`${IconType.DotManualBuilding} manual`}
-        style={style}
-      />
-    )
   }
 }

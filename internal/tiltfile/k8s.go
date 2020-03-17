@@ -2,6 +2,7 @@ package tiltfile
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,7 +16,8 @@ import (
 
 	"github.com/windmilleng/tilt/internal/container"
 	"github.com/windmilleng/tilt/internal/k8s"
-	"github.com/windmilleng/tilt/internal/sliceutils"
+	"github.com/windmilleng/tilt/internal/tiltfile/io"
+	"github.com/windmilleng/tilt/internal/tiltfile/value"
 	"github.com/windmilleng/tilt/pkg/model"
 )
 
@@ -40,7 +42,7 @@ type k8sResource struct {
 	// Map of imageRefs -> count, to avoid dupes / know how many times we've injected each
 	imageRefMap map[string]int
 
-	portForwards []portForward
+	portForwards []model.PortForward
 
 	// labels for pods that we should watch and associate with this resource
 	extraPodSelectors []labels.Selector
@@ -48,6 +50,8 @@ type k8sResource struct {
 	dependencyIDs []model.TargetID
 
 	triggerMode triggerMode
+
+	resourceDeps []string
 }
 
 const deprecatedResourceAssemblyV1Warning = "This Tiltfile is using k8s resource assembly version 1, which has been " +
@@ -57,11 +61,11 @@ const deprecatedResourceAssemblyV1Warning = "This Tiltfile is using k8s resource
 type k8sResourceOptions struct {
 	// if non-empty, how to rename this resource
 	newName           string
-	portForwards      []portForward
+	portForwards      []model.PortForward
 	extraPodSelectors []labels.Selector
 	triggerMode       triggerMode
 	tiltfilePosition  syntax.Position
-	consumed          bool
+	resourceDeps      []string
 }
 
 func (r *k8sResource) addRefSelector(selector container.RefSelector) {
@@ -164,17 +168,9 @@ func (s *tiltfileState) filterYaml(thread *starlark.Thread, fn *starlark.Builtin
 		return nil, err
 	}
 
-	var metaLabels map[string]string
-	if labelsValue != nil {
-		d, ok := labelsValue.(*starlark.Dict)
-		if !ok {
-			return nil, fmt.Errorf("kwarg `labels`: expected dict, got %T", labelsValue)
-		}
-
-		metaLabels, err = skylarkStringDictToGoMap(d)
-		if err != nil {
-			return nil, fmt.Errorf("kwarg `labels`: %v", err)
-		}
+	metaLabels, err := value.ValueToStringMap(labelsValue)
+	if err != nil {
+		return nil, fmt.Errorf("kwarg `labels`: %v", err)
 	}
 
 	entities, err := s.yamlEntitiesFromSkylarkValueOrList(thread, yamlValue)
@@ -216,19 +212,22 @@ func (s *tiltfileState) filterYaml(thread *starlark.Thread, fn *starlark.Builtin
 
 	var source string
 	switch y := yamlValue.(type) {
-	case *blob:
-		source = y.source
+	case io.Blob:
+		source = y.Source
 	default:
 		source = "filter_yaml"
 	}
 
 	return starlark.Tuple{
-		newBlob(matchingStr, source), newBlob(restStr, source),
+		io.NewBlob(matchingStr, source), io.NewBlob(restStr, source),
 	}, nil
 }
 
 func (s *tiltfileState) k8sResourceV1(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	s.warnings = sliceutils.AppendWithoutDupes(s.warnings, deprecatedResourceAssemblyV1Warning)
+	if !s.warnedDeprecatedResourceAssembly {
+		s.logger.Warnf("%s", deprecatedResourceAssemblyV1Warning)
+		s.warnedDeprecatedResourceAssembly = true
+	}
 
 	var name string
 	var yamlValue starlark.Value
@@ -280,7 +279,7 @@ func (s *tiltfileState) k8sResourceV1(thread *starlark.Thread, fn *starlark.Buil
 	}
 
 	if imageRefAsStr != "" {
-		imageRef, err := reference.ParseNormalizedNamed(imageRefAsStr)
+		imageRef, err := container.ParseNamed(imageRefAsStr)
 		if err != nil {
 			return nil, err
 		}
@@ -331,7 +330,7 @@ func (s *tiltfileState) isProbablyK8sResourceV1Call(args starlark.Tuple, kwargs 
 		switch x := args[1].(type) {
 		case starlark.Sequence:
 			return true, "second arg was a sequence"
-		case *blob:
+		case io.Blob:
 			return true, "second arg was a blob"
 		// if a Tiltfile contains `k8s_resource('foo', 'foo.yaml')`
 		// in v1, the second arg is a yaml file name
@@ -361,6 +360,7 @@ func (s *tiltfileState) k8sResourceV2(thread *starlark.Thread, fn *starlark.Buil
 	var portForwardsVal starlark.Value
 	var extraPodSelectorsVal starlark.Value
 	var triggerMode triggerMode
+	var resourceDepsVal starlark.Sequence
 
 	if err := s.unpackArgs(fn.Name(), args, kwargs,
 		"workload", &workload,
@@ -368,6 +368,7 @@ func (s *tiltfileState) k8sResourceV2(thread *starlark.Thread, fn *starlark.Buil
 		"port_forwards?", &portForwardsVal,
 		"extra_pod_selectors?", &extraPodSelectorsVal,
 		"trigger_mode?", &triggerMode,
+		"resource_deps?", &resourceDepsVal,
 	); err != nil {
 		return nil, err
 	}
@@ -390,12 +391,18 @@ func (s *tiltfileState) k8sResourceV2(thread *starlark.Thread, fn *starlark.Buil
 		return nil, fmt.Errorf("%s already called for %s, at %s", fn.Name(), workload, opts.tiltfilePosition.String())
 	}
 
+	resourceDeps, err := value.SequenceToStringSlice(resourceDepsVal)
+	if err != nil {
+		return nil, errors.Wrapf(err, "%s: resource_deps", fn.Name())
+	}
+
 	s.k8sResourceOptions[workload] = k8sResourceOptions{
 		newName:           newName,
 		portForwards:      portForwards,
 		extraPodSelectors: extraPodSelectors,
 		tiltfilePosition:  thread.CallFrame(1).Pos,
 		triggerMode:       triggerMode,
+		resourceDeps:      resourceDeps,
 	}
 
 	return starlark.None, nil
@@ -672,10 +679,10 @@ func (s *tiltfileState) yamlEntitiesFromSkylarkValueOrList(thread *starlark.Thre
 	return ret, nil
 }
 
-func parseYAMLFromBlob(blob blob) ([]k8s.K8sEntity, error) {
+func parseYAMLFromBlob(blob io.Blob) ([]k8s.K8sEntity, error) {
 	ret, err := k8s.ParseYAMLFromString(blob.String())
 	if err != nil {
-		return nil, errors.Wrapf(err, "Error reading yaml from %s", blob.source)
+		return nil, errors.Wrapf(err, "Error reading yaml from %s", blob.Source)
 	}
 	return ret, nil
 }
@@ -684,14 +691,14 @@ func (s *tiltfileState) yamlEntitiesFromSkylarkValue(thread *starlark.Thread, v 
 	switch v := v.(type) {
 	case nil:
 		return nil, nil
-	case *blob:
-		return parseYAMLFromBlob(*v)
+	case io.Blob:
+		return parseYAMLFromBlob(v)
 	default:
-		yamlPath, err := s.absPathFromStarlarkValue(thread, v)
+		yamlPath, err := value.ValueToAbsPath(thread, v)
 		if err != nil {
 			return nil, err
 		}
-		bs, err := s.readFile(yamlPath)
+		bs, err := io.ReadFile(thread, yamlPath)
 		if err != nil {
 			return nil, errors.Wrap(err, "error reading yaml file")
 		}
@@ -707,7 +714,7 @@ func (s *tiltfileState) yamlEntitiesFromSkylarkValue(thread *starlark.Thread, v 
 	}
 }
 
-func convertPortForwards(val starlark.Value) ([]portForward, error) {
+func convertPortForwards(val starlark.Value) ([]model.PortForward, error) {
 	if val == nil {
 		return nil, nil
 	}
@@ -717,19 +724,19 @@ func convertPortForwards(val starlark.Value) ([]portForward, error) {
 		if err != nil {
 			return nil, err
 		}
-		return []portForward{pf}, nil
+		return []model.PortForward{pf}, nil
 
 	case starlark.String:
 		pf, err := stringToPortForward(val)
 		if err != nil {
 			return nil, err
 		}
-		return []portForward{pf}, nil
+		return []model.PortForward{pf}, nil
 
 	case portForward:
-		return []portForward{val}, nil
+		return []model.PortForward{val.PortForward}, nil
 	case starlark.Sequence:
-		var result []portForward
+		var result []model.PortForward
 		it := val.Iterate()
 		defer it.Done()
 		var i starlark.Value
@@ -750,7 +757,7 @@ func convertPortForwards(val starlark.Value) ([]portForward, error) {
 				result = append(result, pf)
 
 			case portForward:
-				result = append(result, i)
+				result = append(result, i.PortForward)
 			default:
 				return nil, fmt.Errorf("port_forwards arg %v includes element %v which must be an int or a port_forward; is a %T", val, i, i)
 			}
@@ -769,18 +776,19 @@ func (s *tiltfileState) portForward(thread *starlark.Thread, fn *starlark.Builti
 		return nil, err
 	}
 
-	return portForward{local: local, container: container}, nil
+	return portForward{
+		model.PortForward{LocalPort: local, ContainerPort: container},
+	}, nil
 }
 
 type portForward struct {
-	local     int
-	container int
+	model.PortForward
 }
 
 var _ starlark.Value = portForward{}
 
 func (f portForward) String() string {
-	return fmt.Sprintf("port_forward(%d, %d)", f.local, f.container)
+	return fmt.Sprintf("port_forward(%d, %d)", f.LocalPort, f.ContainerPort)
 }
 
 func (f portForward) Type() string {
@@ -790,47 +798,58 @@ func (f portForward) Type() string {
 func (f portForward) Freeze() {}
 
 func (f portForward) Truth() starlark.Bool {
-	return f.local != 0 && f.container != 0
+	return f.PortForward != model.PortForward{}
 }
 
 func (f portForward) Hash() (uint32, error) {
 	return 0, fmt.Errorf("unhashable type: port_forward")
 }
 
-func intToPortForward(i starlark.Int) (portForward, error) {
+func intToPortForward(i starlark.Int) (model.PortForward, error) {
 	n, ok := i.Int64()
 	if !ok {
-		return portForward{}, fmt.Errorf("portForward value %v is not representable as an int64", i)
+		return model.PortForward{}, fmt.Errorf("portForward port value %v is not representable as an int64", i)
 	}
 	if n < 0 || n > 65535 {
-		return portForward{}, fmt.Errorf("portForward value %v is not in the range for a port [0-65535]", n)
+		return model.PortForward{}, fmt.Errorf("portForward port value %v is not in the valid range [0-65535]", n)
 	}
-	return portForward{local: int(n)}, nil
+	return model.PortForward{LocalPort: int(n)}, nil
 }
 
-func stringToPortForward(s starlark.String) (portForward, error) {
-	parts := strings.SplitN(string(s), ":", 2)
-	local, err := strconv.Atoi(parts[0])
+const ipReStr = `^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$`
+const hostnameReStr = `^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$`
+
+var validHost = regexp.MustCompile(ipReStr + "|" + hostnameReStr)
+
+func stringToPortForward(s starlark.String) (model.PortForward, error) {
+	parts := strings.SplitN(string(s), ":", 3)
+
+	var host string
+	var localString string
+	if len(parts) == 3 {
+		localString = parts[1]
+		host = parts[0]
+		if !validHost.MatchString(host) {
+			return model.PortForward{}, fmt.Errorf("portForward host value %q is not a valid hostname or IP address", localString)
+		}
+	} else {
+		localString = parts[0]
+	}
+
+	local, err := strconv.Atoi(localString)
 	if err != nil || local < 0 || local > 65535 {
-		return portForward{}, fmt.Errorf("portForward value %q is not in the range for a port [0-65535]", parts[0])
+		return model.PortForward{}, fmt.Errorf("portForward port value %q is not in the valid range [0-65535]", localString)
 	}
 
 	var container int
-	if len(parts) == 2 {
-		container, err = strconv.Atoi(parts[1])
+	if len(parts) > 1 {
+		last := parts[len(parts)-1]
+		container, err = strconv.Atoi(last)
 		if err != nil || container < 0 || container > 65535 {
-			return portForward{}, fmt.Errorf("portForward value %q is not in the range for a port [0-65535]", parts[1])
+			return model.PortForward{}, fmt.Errorf("portForward port value %q is not in the valid range [0-65535]", last)
 		}
 	}
-	return portForward{local: local, container: container}, nil
-}
-
-func (s *tiltfileState) portForwardsToDomain(r *k8sResource) []model.PortForward {
-	var result []model.PortForward
-	for _, pf := range r.portForwards {
-		result = append(result, model.PortForward{LocalPort: pf.local, ContainerPort: pf.container})
-	}
-	return result
+	return model.PortForward{LocalPort: local, ContainerPort: container, Host: host}, nil
 }
 
 // returns any defined image JSON paths that apply to the given entity
@@ -863,8 +882,9 @@ func (s *tiltfileState) k8sResourceAssemblyVersionFn(thread *starlark.Thread, fn
 		return starlark.None, fmt.Errorf("invalid %s %d. Must be 1 or 2.", fn.Name(), version)
 	}
 
-	if version == 1 {
-		s.warnings = append(s.warnings, deprecatedResourceAssemblyV1Warning)
+	if version == 1 && !s.warnedDeprecatedResourceAssembly {
+		s.logger.Warnf("%s", deprecatedResourceAssemblyV1Warning)
+		s.warnedDeprecatedResourceAssembly = true
 	}
 
 	s.k8sResourceAssemblyVersion = version
@@ -889,12 +909,14 @@ func (s *tiltfileState) calculateResourceNames(workloads []k8s.K8sEntity) ([]str
 func (s *tiltfileState) workloadToResourceFunctionNames(workloads []k8s.K8sEntity) ([]string, error) {
 	takenNames := make(map[string]k8s.K8sEntity)
 	ret := make([]string, len(workloads))
-	thread := s.starlarkThread()
+	thread := &starlark.Thread{
+		Print: s.print,
+	}
 	for i, e := range workloads {
 		id := newK8sObjectID(e)
 		name, err := s.workloadToResourceFunction.fn(thread, id)
 		if err != nil {
-			return nil, errors.Wrapf(err, "error determing resource name for '%s'", id.String())
+			return nil, errors.Wrapf(err, "error determining resource name for '%s'", id.String())
 		}
 
 		if conflictingWorkload, ok := takenNames[name]; ok {
@@ -915,43 +937,4 @@ func newK8sObjectID(e k8s.K8sEntity) k8sObjectID {
 		namespace: e.Namespace().String(),
 		group:     gvk.Group,
 	}
-}
-
-func (s *tiltfileState) k8sContext(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	return starlark.String(s.kubeContext), nil
-}
-
-func (s *tiltfileState) allowK8SContexts(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var contexts starlark.Value
-	if err := s.unpackArgs(fn.Name(), args, kwargs,
-		"contexts", &contexts,
-	); err != nil {
-		return nil, err
-	}
-
-	for _, c := range starlarkValueOrSequenceToSlice(contexts) {
-		switch val := c.(type) {
-		case starlark.String:
-			s.allowedK8SContexts = append(s.allowedK8SContexts, k8s.KubeContext(val))
-		default:
-			return nil, fmt.Errorf("allow_k8s_contexts contexts must be a string or a sequence of strings; found a %T", val)
-
-		}
-	}
-
-	return starlark.None, nil
-}
-
-func (s *tiltfileState) validateK8SContext() error {
-	if s.kubeEnv == k8s.EnvNone || s.kubeEnv.IsLocalCluster() {
-		return nil
-	}
-
-	for _, c := range s.allowedK8SContexts {
-		if c == s.kubeContext {
-			return nil
-		}
-	}
-
-	return fmt.Errorf("'%s' is not a known local context", s.kubeContext)
 }

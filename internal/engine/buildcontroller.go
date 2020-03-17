@@ -2,18 +2,21 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"time"
 
+	"github.com/windmilleng/tilt/internal/engine/buildcontrol"
 	"github.com/windmilleng/tilt/internal/ospath"
 	"github.com/windmilleng/tilt/internal/store"
 	"github.com/windmilleng/tilt/pkg/logger"
 	"github.com/windmilleng/tilt/pkg/model"
+	"github.com/windmilleng/tilt/pkg/model/logstore"
 )
 
 type BuildController struct {
 	b                  BuildAndDeployer
-	lastActionCount    int
+	buildsStartedCount int // used to synchronize with state
 	disabledForTesting bool
 }
 
@@ -24,147 +27,13 @@ type buildEntry struct {
 	filesChanged  []string
 	buildReason   model.BuildReason
 	firstBuild    bool
+	spanID        logstore.SpanID
 }
 
 func NewBuildController(b BuildAndDeployer) *BuildController {
 	return &BuildController{
-		b:               b,
-		lastActionCount: -1,
+		b: b,
 	}
-}
-
-// Algorithm to choose a manifest to build next.
-func nextTargetToBuild(state store.EngineState) *store.ManifestTarget {
-	// Don't build anything if there are pending config file changes.
-	// We want the Tiltfile to re-run first.
-	if len(state.PendingConfigFileChanges) > 0 {
-		return nil
-	}
-
-	targets := state.Targets()
-
-	// If any of the manifest target's haven't been built yet, build them now.
-	unbuilt := findUnbuiltTargets(targets)
-	if len(unbuilt) > 0 {
-		return nextUnbuiltTargetToBuild(unbuilt)
-	}
-
-	// Next prioritize builds that crashed and need a rebuilt to have up-to-date code.
-	for _, mt := range targets {
-		if mt.State.NeedsRebuildFromCrash {
-			return mt
-		}
-	}
-
-	// Next prioritize builds that are have been manually triggered.
-	if len(state.TriggerQueue) > 0 {
-		mn := state.TriggerQueue[0]
-		mt, ok := state.ManifestTargets[mn]
-		if ok {
-			return mt
-		}
-	}
-
-	return earliestPendingAutoTriggerTarget(targets)
-}
-
-// Go through all the manifests, and check:
-// 1) all pending file changes, and
-// 2) all pending manifest changes
-// The earliest one is the one we want.
-//
-// If no targets are pending, return nil
-func earliestPendingAutoTriggerTarget(targets []*store.ManifestTarget) *store.ManifestTarget {
-	var choice *store.ManifestTarget
-	earliest := time.Now()
-
-	for _, mt := range targets {
-		ok, newTime := mt.State.HasPendingChangesBefore(earliest)
-		if ok {
-			if mt.Manifest.TriggerMode == model.TriggerModeManual {
-				// Don't trigger update of a manual manifest just b/c if has
-				// pending changes; must come through the TriggerQueue, above.
-				continue
-			}
-			choice = mt
-			earliest = newTime
-		}
-	}
-
-	return choice
-}
-
-// Helper function for ordering targets that have never been built before.
-func nextUnbuiltTargetToBuild(unbuilt []*store.ManifestTarget) *store.ManifestTarget {
-	// unresourced YAML goes first
-	unresourced := findUnresourcedYAML(unbuilt)
-	if unresourced != nil {
-		return unresourced
-	}
-
-	// Local resources come before all cluster resources (b/c LR's may
-	// change things on disk that cluster resources then pull in).
-	localTargets := findLocalTargets(unbuilt)
-	if len(localTargets) > 0 {
-		return localTargets[0]
-	}
-
-	// If this is Kubernetes, unbuilt resources go first.
-	// (If this is Docker Compose, we want to trust the ordering
-	// that docker-compose put things in.)
-	deployOnlyK8sTargets := findDeployOnlyK8sManifestTargets(unbuilt)
-	if len(deployOnlyK8sTargets) > 0 {
-		return deployOnlyK8sTargets[0]
-	}
-
-	return unbuilt[0]
-}
-
-func findUnbuiltTargets(targets []*store.ManifestTarget) []*store.ManifestTarget {
-	result := []*store.ManifestTarget{}
-	for _, target := range targets {
-		if !target.State.StartedFirstBuild() {
-			result = append(result, target)
-		}
-	}
-	return result
-}
-
-func findUnresourcedYAML(targets []*store.ManifestTarget) *store.ManifestTarget {
-	for _, target := range targets {
-		if target.Manifest.ManifestName() == model.UnresourcedYAMLManifestName {
-			return target
-		}
-	}
-	return nil
-}
-
-func findDeployOnlyK8sManifestTargets(targets []*store.ManifestTarget) []*store.ManifestTarget {
-	result := []*store.ManifestTarget{}
-	for _, target := range targets {
-		if target.Manifest.IsK8s() && len(target.Manifest.ImageTargets) == 0 {
-			result = append(result, target)
-		}
-	}
-	return result
-}
-
-func findLocalTargets(targets []*store.ManifestTarget) []*store.ManifestTarget {
-	result := []*store.ManifestTarget{}
-	for _, target := range targets {
-		if target.Manifest.IsLocal() {
-			result = append(result, target)
-		}
-	}
-	return result
-}
-
-func nextManifestNameToBuild(state store.EngineState) model.ManifestName {
-	mt := nextTargetToBuild(state)
-	if mt == nil {
-		return ""
-	}
-	return mt.Manifest.Name
 }
 
 func (c *BuildController) needsBuild(ctx context.Context, st store.RStore) (buildEntry, bool) {
@@ -173,23 +42,28 @@ func (c *BuildController) needsBuild(ctx context.Context, st store.RStore) (buil
 
 	// Don't start the next build until the previous action has been recorded,
 	// so that we don't accidentally repeat the same build.
-	if c.lastActionCount == state.BuildControllerActionCount {
+	if c.buildsStartedCount != state.StartedBuildCount {
 		return buildEntry{}, false
 	}
 
-	mt := nextTargetToBuild(state)
+	// no build slots available
+	if state.AvailableBuildSlots() < 1 {
+		return buildEntry{}, false
+	}
+
+	mt := buildcontrol.NextTargetToBuild(state)
 	if mt == nil {
 		return buildEntry{}, false
 	}
 
-	c.lastActionCount = state.BuildControllerActionCount
+	c.buildsStartedCount += 1
 	ms := mt.State
 	manifest := mt.Manifest
 	firstBuild := !ms.StartedFirstBuild()
 
-	buildReason := ms.NextBuildReason()
+	buildReason := mt.NextBuildReason()
 	targets := buildTargets(manifest)
-	buildStateSet := buildStateSet(ctx, manifest, targets, ms)
+	buildStateSet := buildStateSet(ctx, manifest, targets, ms, buildReason)
 
 	return buildEntry{
 		name:          manifest.Name,
@@ -198,6 +72,7 @@ func (c *BuildController) needsBuild(ctx context.Context, st store.RStore) (buil
 		buildReason:   buildReason,
 		buildStateSet: buildStateSet,
 		filesChanged:  append(ms.ConfigFilesThatCausedChange, buildStateSet.FilesChanged()...),
+		spanID:        SpanIDForBuildLog(c.buildsStartedCount),
 	}, true
 }
 
@@ -214,24 +89,27 @@ func (c *BuildController) OnChange(ctx context.Context, st store.RStore) {
 		return
 	}
 
+	st.Dispatch(buildcontrol.BuildStartedAction{
+		ManifestName: entry.name,
+		StartTime:    time.Now(),
+		FilesChanged: entry.filesChanged,
+		Reason:       entry.buildReason,
+		SpanID:       entry.spanID,
+	})
+
 	go func() {
 		// Send the logs to both the EngineState and the normal log stream.
 		actionWriter := BuildLogActionWriter{
 			store:        st,
 			manifestName: entry.name,
+			spanID:       entry.spanID,
 		}
-		ctx := logger.WithLogger(ctx, logger.NewLogger(logger.Get(ctx).Level(), actionWriter))
+		ctx := logger.CtxWithLogHandler(ctx, actionWriter)
 
-		st.Dispatch(BuildStartedAction{
-			ManifestName: entry.name,
-			StartTime:    time.Now(),
-			FilesChanged: entry.filesChanged,
-			Reason:       entry.buildReason,
-		})
 		c.logBuildEntry(ctx, entry)
 
 		result, err := c.buildAndDeploy(ctx, st, entry)
-		st.Dispatch(NewBuildCompleteAction(result, err))
+		st.Dispatch(buildcontrol.NewBuildCompleteAction(entry.name, entry.spanID, result, err))
 	}()
 }
 
@@ -249,35 +127,39 @@ func (c *BuildController) buildAndDeploy(ctx context.Context, st store.RStore, e
 func (c *BuildController) logBuildEntry(ctx context.Context, entry buildEntry) {
 	firstBuild := entry.firstBuild
 	name := entry.name
+	buildReason := entry.buildReason
 	changedFiles := entry.filesChanged
 
-	l := logger.Get(ctx)
+	l := logger.Get(ctx).WithFields(logger.Fields{logger.FieldNameBuildEvent: "init"})
+	delimiter := "•"
 	if firstBuild {
-		p := logger.Blue(l).Sprintf("──┤ Building: ")
-		s := logger.Blue(l).Sprintf(" ├──────────────────────────────────────────────")
-		l.Infof("\n%s%s%s", p, name, s)
+		l.Infof("Initial Build %s %s", delimiter, name)
 	} else {
 		if len(changedFiles) > 0 {
-			p := logger.Green(l).Sprintf("%d changed: ", len(changedFiles))
-			l.Infof("\n%s%v\n", p, ospath.FormatFileChangeList(changedFiles))
+			t := "File"
+			if len(changedFiles) > 1 {
+				t = "Files"
+			}
+			l.Infof("%d %s Changed: %s %s %s", len(changedFiles), t, ospath.FormatFileChangeList(changedFiles), delimiter, name)
+		} else {
+			l.Infof("%s %s %s", buildReason, delimiter, name)
 		}
-
-		rp := logger.Blue(l).Sprintf("──┤ Rebuilding: ")
-		rs := logger.Blue(l).Sprintf(" ├────────────────────────────────────────────")
-		l.Infof("\n%s%s%s", rp, name, rs)
 	}
 }
 
 type BuildLogActionWriter struct {
 	store        store.RStore
 	manifestName model.ManifestName
+	spanID       logstore.SpanID
 }
 
-func (w BuildLogActionWriter) Write(p []byte) (n int, err error) {
-	w.store.Dispatch(BuildLogAction{
-		LogEvent: store.NewLogEvent(w.manifestName, p),
-	})
-	return len(p), nil
+func (w BuildLogActionWriter) Write(level logger.Level, fields logger.Fields, p []byte) error {
+	w.store.Dispatch(store.NewLogAction(w.manifestName, w.spanID, level, fields, p))
+	return nil
+}
+
+func SpanIDForBuildLog(buildCount int) logstore.SpanID {
+	return logstore.SpanID(fmt.Sprintf("build:%d", buildCount))
 }
 
 // Extract target specs from a manifest for BuildAndDeploy.
@@ -300,8 +182,9 @@ func buildTargets(manifest model.Manifest) []model.TargetSpec {
 }
 
 // Extract a set of build states from a manifest for BuildAndDeploy.
-func buildStateSet(ctx context.Context, manifest model.Manifest, specs []model.TargetSpec, ms *store.ManifestState) store.BuildStateSet {
-	buildStateSet := store.BuildStateSet{}
+func buildStateSet(ctx context.Context, manifest model.Manifest, specs []model.TargetSpec,
+	ms *store.ManifestState, reason model.BuildReason) store.BuildStateSet {
+	result := store.BuildStateSet{}
 
 	for _, spec := range specs {
 		id := spec.ID()
@@ -310,8 +193,8 @@ func buildStateSet(ctx context.Context, manifest model.Manifest, specs []model.T
 		}
 
 		status := ms.BuildStatus(id)
-		filesChanged := make([]string, 0, len(status.PendingFileChanges))
-		for file, _ := range status.PendingFileChanges {
+		var filesChanged []string
+		for file := range status.PendingFileChanges {
 			filesChanged = append(filesChanged, file)
 		}
 		sort.Strings(filesChanged)
@@ -333,12 +216,10 @@ func buildStateSet(ctx context.Context, manifest model.Manifest, specs []model.T
 				if manifest.IsK8s() {
 					cInfos, err := store.RunningContainersForTargetForOnePod(iTarget, ms.K8sRuntimeState())
 					if err != nil {
-						// Couldn't get running container info; surface an error IF target has LiveUpdate instructions.
-						if !iTarget.AnyFastBuildInfo().Empty() || !iTarget.AnyLiveUpdateInfo().Empty() {
-							logger.Get(ctx).Infof("CANNOT PERFORM LIVE UPDATE ON IMAGE %s:\n\t%v", iTarget.ID(), err)
-						}
+						buildState = buildState.WithRunningContainerError(err)
+					} else {
+						buildState = buildState.WithRunningContainers(cInfos)
 					}
-					buildState = buildState.WithRunningContainers(cInfos)
 				}
 
 				if manifest.IsDC() {
@@ -346,10 +227,20 @@ func buildStateSet(ctx context.Context, manifest model.Manifest, specs []model.T
 				}
 			}
 		}
-		buildStateSet[id] = buildState
+		result[id] = buildState
 	}
 
-	return buildStateSet
+	isLiveUpdateEligibleTrigger := reason.HasTrigger() &&
+		reason.Has(model.BuildReasonFlagChangedFiles) &&
+		manifest.TriggerMode != model.TriggerModeAuto
+	isImageBuildTrigger := reason.HasTrigger() && !isLiveUpdateEligibleTrigger
+	if isImageBuildTrigger {
+		for k, v := range result {
+			result[k] = v.WithImageBuildTriggered(true)
+		}
+	}
+
+	return result
 }
 
 var _ store.Subscriber = &BuildController{}

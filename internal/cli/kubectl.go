@@ -1,14 +1,18 @@
 package cli
 
 import (
+	goflag "flag"
 	"os"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
+	cliflag "k8s.io/component-base/cli/flag"
 	"k8s.io/kubectl/pkg/cmd/apply"
 	"k8s.io/kubectl/pkg/cmd/delete"
 	"k8s.io/kubectl/pkg/cmd/replace"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
+	"k8s.io/kubectl/pkg/util/logs"
 )
 
 // Currently, the implementation of `kubectl apply` is a complex protocol
@@ -32,8 +36,9 @@ import (
 // in the kubectl commands we need and shell out.
 func newKubectlCmd() *cobra.Command {
 	result := &cobra.Command{
-		Use:   "kubectl",
-		Short: "kubectl controls the Kubernetes cluster manager",
+		Use:    "kubectl",
+		Short:  "kubectl controls the Kubernetes cluster manager",
+		Hidden: true,
 	}
 
 	genericFlags := genericclioptions.NewConfigFlags(true)
@@ -53,4 +58,18 @@ func newKubectlCmd() *cobra.Command {
 	result.AddCommand(cmdReplace)
 	result.AddCommand(cmdDelete)
 	return result
+}
+
+// Flag initialization that only happens if we're acting as a kubernetes client.
+// Adapted from
+// https://github.com/kubernetes/kubernetes/tree/master/cmd/kubectl
+//
+// Returns a flush() function to be passed to a defer.
+func preKubectlCmdInit() func() {
+	pflag.CommandLine.SetNormalizeFunc(cliflag.WordSepNormalizeFunc)
+	pflag.CommandLine.AddGoFlagSet(goflag.CommandLine)
+	logs.InitLogs()
+	return func() {
+		logs.FlushLogs()
+	}
 }

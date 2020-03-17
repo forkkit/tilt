@@ -4,7 +4,6 @@ import (
 	"archive/tar"
 	"context"
 	"fmt"
-	"io"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +12,7 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/opencontainers/go-digest"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/windmilleng/wmclient/pkg/dirs"
 	v1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -28,61 +28,11 @@ import (
 	"github.com/windmilleng/tilt/pkg/model"
 )
 
-func TestDockerBuildWithCache(t *testing.T) {
-	f := newIBDFixture(t, k8s.EnvGKE)
-	defer f.TearDown()
-
-	manifest := NewSanchoDockerBuildManifestWithCache(f, []string{"/root/.cache"})
-	cache := "gcr.io/some-project-162817/sancho:tilt-cache-3de427a264f80719a58a9abd456487b3"
-	f.docker.Images[cache] = types.ImageInspect{}
-
-	_, err := f.ibd.BuildAndDeploy(f.ctx, f.st, buildTargets(manifest), store.BuildStateSet{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	expected := expectedFile{
-		Path: "Dockerfile",
-		Contents: `FROM gcr.io/some-project-162817/sancho:tilt-cache-3de427a264f80719a58a9abd456487b3
-LABEL "tilt.cache"="0"
-ADD . .
-RUN go install github.com/windmilleng/sancho
-ENTRYPOINT /go/bin/sancho
-`,
-	}
-	testutils.AssertFileInTar(t, tar.NewReader(f.docker.BuildOptions.Context), expected)
-}
-
-func TestBaseDockerfileWithCache(t *testing.T) {
-	f := newIBDFixture(t, k8s.EnvGKE)
-	defer f.TearDown()
-
-	manifest := NewSanchoFastBuildManifestWithCache(f, []string{"/root/.cache"})
-	cache := "gcr.io/some-project-162817/sancho:tilt-cache-3de427a264f80719a58a9abd456487b3"
-	f.docker.Images[cache] = types.ImageInspect{}
-
-	_, err := f.ibd.BuildAndDeploy(f.ctx, f.st, buildTargets(manifest), store.BuildStateSet{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	expected := expectedFile{
-		Path: "Dockerfile",
-		Contents: `FROM gcr.io/some-project-162817/sancho:tilt-cache-3de427a264f80719a58a9abd456487b3
-LABEL "tilt.cache"="0"
-ADD . /
-RUN ["go", "install", "github.com/windmilleng/sancho"]
-ENTRYPOINT ["/go/bin/sancho"]
-LABEL "tilt.buildMode"="scratch"`,
-	}
-	testutils.AssertFileInTar(t, tar.NewReader(f.docker.BuildOptions.Context), expected)
-}
-
 func TestDeployTwinImages(t *testing.T) {
 	f := newIBDFixture(t, k8s.EnvGKE)
 	defer f.TearDown()
 
-	sancho := NewSanchoFastBuildManifest(f)
+	sancho := NewSanchoDockerBuildManifest(f)
 	manifest := sancho.WithDeployTarget(sancho.K8sTarget().AppendYAML(SanchoTwinYAML))
 	result, err := f.ibd.BuildAndDeploy(f.ctx, f.st, buildTargets(manifest), store.BuildStateSet{})
 	if err != nil {
@@ -91,7 +41,8 @@ func TestDeployTwinImages(t *testing.T) {
 
 	id := manifest.ImageTargetAt(0).ID()
 	expectedImage := "gcr.io/some-project-162817/sancho:tilt-11cd0b38bc3ceb95"
-	assert.Equal(t, expectedImage, result[id].Image.String())
+	image := store.ClusterImageRefFromBuildResult(result[id])
+	assert.Equal(t, expectedImage, image.String())
 	assert.Equalf(t, 2, strings.Count(f.k8s.Yaml, expectedImage),
 		"Expected image to update twice in YAML: %s", f.k8s.Yaml)
 }
@@ -114,12 +65,14 @@ func TestDeployPodWithMultipleImages(t *testing.T) {
 	assert.Equal(t, 2, f.docker.BuildCount)
 
 	expectedSanchoRef := "gcr.io/some-project-162817/sancho:tilt-11cd0b38bc3ceb95"
-	assert.Equal(t, expectedSanchoRef, result[iTarget1.ID()].Image.String())
+	image := store.ClusterImageRefFromBuildResult(result[iTarget1.ID()])
+	assert.Equal(t, expectedSanchoRef, image.String())
 	assert.Equalf(t, 1, strings.Count(f.k8s.Yaml, expectedSanchoRef),
 		"Expected image to appear once in YAML: %s", f.k8s.Yaml)
 
 	expectedSidecarRef := "gcr.io/some-project-162817/sancho-sidecar:tilt-11cd0b38bc3ceb95"
-	assert.Equal(t, expectedSidecarRef, result[iTarget2.ID()].Image.String())
+	image = store.ClusterImageRefFromBuildResult(result[iTarget2.ID()])
+	assert.Equal(t, expectedSidecarRef, image.String())
 	assert.Equalf(t, 1, strings.Count(f.k8s.Yaml, expectedSidecarRef),
 		"Expected image to appear once in YAML: %s", f.k8s.Yaml)
 }
@@ -144,12 +97,14 @@ func TestDeployPodWithMultipleLiveUpdateImages(t *testing.T) {
 	assert.Equal(t, 2, f.docker.BuildCount)
 
 	expectedSanchoRef := "gcr.io/some-project-162817/sancho:tilt-11cd0b38bc3ceb95"
-	assert.Equal(t, expectedSanchoRef, result[iTarget1.ID()].Image.String())
+	image := store.ClusterImageRefFromBuildResult(result[iTarget1.ID()])
+	assert.Equal(t, expectedSanchoRef, image.String())
 	assert.Equalf(t, 1, strings.Count(f.k8s.Yaml, expectedSanchoRef),
 		"Expected image to appear once in YAML: %s", f.k8s.Yaml)
 
 	expectedSidecarRef := "gcr.io/some-project-162817/sancho-sidecar:tilt-11cd0b38bc3ceb95"
-	assert.Equal(t, expectedSidecarRef, result[iTarget2.ID()].Image.String())
+	image = store.ClusterImageRefFromBuildResult(result[iTarget2.ID()])
+	assert.Equal(t, expectedSidecarRef, image.String())
 	assert.Equalf(t, 1, strings.Count(f.k8s.Yaml, expectedSidecarRef),
 		"Expected image to appear once in YAML: %s", f.k8s.Yaml)
 
@@ -189,7 +144,7 @@ func TestImageIsClean(t *testing.T) {
 
 	manifest := NewSanchoDockerBuildManifest(f)
 	iTargetID1 := manifest.ImageTargets[0].ID()
-	result1 := store.NewImageBuildResult(iTargetID1, container.MustParseNamedTagged("sancho-base:tilt-prebuilt1"))
+	result1 := store.NewImageBuildResultSingleRef(iTargetID1, container.MustParseNamedTagged("sancho-base:tilt-prebuilt1"))
 
 	f.docker.ImageListCount = 1
 
@@ -213,11 +168,9 @@ func TestImageIsDirtyAfterContainerBuild(t *testing.T) {
 
 	manifest := NewSanchoDockerBuildManifest(f)
 	iTargetID1 := manifest.ImageTargets[0].ID()
-	result1 := store.BuildResult{
-		TargetID:                iTargetID1,
-		Image:                   container.MustParseNamedTagged("sancho-base:tilt-prebuilt1"),
-		LiveUpdatedContainerIDs: []container.ID{container.ID("12345")},
-	}
+	result1 := store.NewLiveUpdateBuildResult(
+		iTargetID1,
+		[]container.ID{container.ID("12345")})
 
 	stateSet := store.BuildStateSet{
 		iTargetID1: store.NewBuildState(result1, []string{}),
@@ -245,12 +198,59 @@ func TestMultiStageDockerBuild(t *testing.T) {
 
 	assert.Equal(t, 2, f.docker.BuildCount)
 	assert.Equal(t, 1, f.docker.PushCount)
-	assert.Equal(t, 0, f.kp.pushCount)
+	assert.Equal(t, 0, f.kl.loadCount)
 
 	expected := expectedFile{
 		Path: "Dockerfile",
 		Contents: `
-FROM docker.io/library/sancho-base:tilt-11cd0b38bc3ceb95
+FROM sancho-base:tilt-11cd0b38bc3ceb95
+ADD . .
+RUN go install github.com/windmilleng/sancho
+ENTRYPOINT /go/bin/sancho
+`,
+	}
+	testutils.AssertFileInTar(t, tar.NewReader(f.docker.BuildOptions.Context), expected)
+}
+
+func TestMultiStageDockerBuildPreservesSyntaxDirective(t *testing.T) {
+	f := newIBDFixture(t, k8s.EnvGKE)
+	defer f.TearDown()
+
+	baseImage := model.MustNewImageTarget(SanchoBaseRef).WithBuildDetails(model.DockerBuild{
+		Dockerfile: `FROM golang:1.10`,
+		BuildPath:  f.JoinPath("sancho-base"),
+	})
+
+	srcImage := model.MustNewImageTarget(SanchoRef).WithBuildDetails(model.DockerBuild{
+		Dockerfile: `# syntax = docker/dockerfile:experimental
+
+FROM sancho-base
+ADD . .
+RUN go install github.com/windmilleng/sancho
+ENTRYPOINT /go/bin/sancho
+`,
+		BuildPath: f.JoinPath("sancho"),
+	}).WithDependencyIDs([]model.TargetID{baseImage.ID()})
+
+	m := manifestbuilder.New(f, "sancho").
+		WithK8sYAML(SanchoYAML).
+		WithImageTargets(baseImage, srcImage).
+		Build()
+
+	_, err := f.ibd.BuildAndDeploy(f.ctx, f.st, buildTargets(m), store.BuildStateSet{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.Equal(t, 2, f.docker.BuildCount)
+	assert.Equal(t, 1, f.docker.PushCount)
+	assert.Equal(t, 0, f.kl.loadCount)
+
+	expected := expectedFile{
+		Path: "Dockerfile",
+		Contents: `# syntax = docker/dockerfile:experimental
+
+FROM sancho-base:tilt-11cd0b38bc3ceb95
 ADD . .
 RUN go install github.com/windmilleng/sancho
 ENTRYPOINT /go/bin/sancho
@@ -266,8 +266,8 @@ func TestMultiStageDockerBuildWithFirstImageDirty(t *testing.T) {
 	manifest := NewSanchoDockerBuildMultiStageManifest(f)
 	iTargetID1 := manifest.ImageTargets[0].ID()
 	iTargetID2 := manifest.ImageTargets[1].ID()
-	result1 := store.NewImageBuildResult(iTargetID1, container.MustParseNamedTagged("sancho-base:tilt-prebuilt1"))
-	result2 := store.NewImageBuildResult(iTargetID2, container.MustParseNamedTagged("sancho:tilt-prebuilt2"))
+	result1 := store.NewImageBuildResultSingleRef(iTargetID1, container.MustParseNamedTagged("sancho-base:tilt-prebuilt1"))
+	result2 := store.NewImageBuildResultSingleRef(iTargetID2, container.MustParseNamedTagged("sancho:tilt-prebuilt2"))
 
 	newFile := f.WriteFile("sancho-base/message.txt", "message")
 
@@ -286,7 +286,7 @@ func TestMultiStageDockerBuildWithFirstImageDirty(t *testing.T) {
 	expected := expectedFile{
 		Path: "Dockerfile",
 		Contents: `
-FROM docker.io/library/sancho-base:tilt-11cd0b38bc3ceb95
+FROM sancho-base:tilt-11cd0b38bc3ceb95
 ADD . .
 RUN go install github.com/windmilleng/sancho
 ENTRYPOINT /go/bin/sancho
@@ -302,8 +302,8 @@ func TestMultiStageDockerBuildWithSecondImageDirty(t *testing.T) {
 	manifest := NewSanchoDockerBuildMultiStageManifest(f)
 	iTargetID1 := manifest.ImageTargets[0].ID()
 	iTargetID2 := manifest.ImageTargets[1].ID()
-	result1 := store.NewImageBuildResult(iTargetID1, container.MustParseNamedTagged("sancho-base:tilt-prebuilt1"))
-	result2 := store.NewImageBuildResult(iTargetID2, container.MustParseNamedTagged("sancho:tilt-prebuilt2"))
+	result1 := store.NewImageBuildResultSingleRef(iTargetID1, container.MustParseNamedTagged("sancho-base:tilt-prebuilt1"))
+	result2 := store.NewImageBuildResultSingleRef(iTargetID2, container.MustParseNamedTagged("sancho:tilt-prebuilt2"))
 
 	newFile := f.WriteFile("sancho/message.txt", "message")
 
@@ -323,7 +323,7 @@ func TestMultiStageDockerBuildWithSecondImageDirty(t *testing.T) {
 	expected := expectedFile{
 		Path: "Dockerfile",
 		Contents: `
-FROM docker.io/library/sancho-base:tilt-prebuilt1
+FROM sancho-base:tilt-prebuilt1
 ADD . .
 RUN go install github.com/windmilleng/sancho
 ENTRYPOINT /go/bin/sancho
@@ -332,8 +332,8 @@ ENTRYPOINT /go/bin/sancho
 	testutils.AssertFileInTar(t, tar.NewReader(f.docker.BuildOptions.Context), expected)
 }
 
-func TestKINDPush(t *testing.T) {
-	f := newIBDFixture(t, k8s.EnvKIND)
+func TestKINDLoad(t *testing.T) {
+	f := newIBDFixture(t, k8s.EnvKIND6)
 	defer f.TearDown()
 
 	manifest := NewSanchoDockerBuildManifest(f)
@@ -343,12 +343,36 @@ func TestKINDPush(t *testing.T) {
 	}
 
 	assert.Equal(t, 1, f.docker.BuildCount)
-	assert.Equal(t, 1, f.kp.pushCount)
+	assert.Equal(t, 1, f.kl.loadCount)
 	assert.Equal(t, 0, f.docker.PushCount)
 }
 
+func TestDockerPushIfKINDAndClusterRef(t *testing.T) {
+	f := newIBDFixture(t, k8s.EnvKIND6)
+	defer f.TearDown()
+
+	manifest := NewSanchoDockerBuildManifest(f)
+	iTarg := manifest.ImageTargetAt(0)
+	iTarg.Refs = iTarg.Refs.MustWithRegistry(container.MustNewRegistryWithHostFromCluster("localhost:1234", "registry:1234"))
+	manifest = manifest.WithImageTarget(iTarg)
+
+	_, err := f.ibd.BuildAndDeploy(f.ctx, f.st, buildTargets(manifest), store.BuildStateSet{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.Equal(t, 1, f.docker.BuildCount, "Docker build count")
+	assert.Equal(t, 0, f.kl.loadCount, "KIND load count")
+	assert.Equal(t, 1, f.docker.PushCount, "Docker push count")
+	assert.Equal(t, iTarg.Refs.LocalRef().String(), container.MustParseNamed(f.docker.PushImage).Name(), "image pushed to Docker as LocalRef")
+
+	yaml := f.k8s.Yaml
+	assert.Contains(t, yaml, iTarg.Refs.ClusterRef().String(), "ClusterRef was injected into applied YAML")
+	assert.NotContains(t, yaml, iTarg.Refs.LocalRef().String(), "LocalRef was NOT injected into applied YAML")
+}
+
 func TestCustomBuildDisablePush(t *testing.T) {
-	f := newIBDFixture(t, k8s.EnvKIND)
+	f := newIBDFixture(t, k8s.EnvKIND6)
 	defer f.TearDown()
 	sha := digest.Digest("sha256:11cd0eb38bc3ceb958ffb2f9bd70be3fb317ce7d255c8a4c3f4af30e298aa1aab")
 	f.docker.Images["gcr.io/some-project-162817/sancho:tilt-build"] = types.ImageInspect{ID: string(sha)}
@@ -357,23 +381,57 @@ func TestCustomBuildDisablePush(t *testing.T) {
 	_, err := f.ibd.BuildAndDeploy(f.ctx, f.st, buildTargets(manifest), store.BuildStateSet{})
 	assert.NoError(t, err)
 
-	// but we also didn't try to build or push an image
+	// We didn't try to build or push an image, but we did try to tag it
 	assert.Equal(t, 0, f.docker.BuildCount)
-	assert.Equal(t, 0, f.kp.pushCount)
+	assert.Equal(t, 1, f.docker.TagCount)
+	assert.Equal(t, 0, f.kl.loadCount)
 	assert.Equal(t, 0, f.docker.PushCount)
 }
 
-func TestDeployUsesInjectRef(t *testing.T) {
+func TestCustomBuildSkipsLocalDocker(t *testing.T) {
+	f := newIBDFixture(t, k8s.EnvKIND6)
+	defer f.TearDown()
+	sha := digest.Digest("sha256:11cd0eb38bc3ceb958ffb2f9bd70be3fb317ce7d255c8a4c3f4af30e298aa1aab")
+	f.docker.Images["gcr.io/some-project-162817/sancho:tilt-build"] = types.ImageInspect{ID: string(sha)}
+
+	cb := model.CustomBuild{
+		Command:          "true",
+		Deps:             []string{f.JoinPath("app")},
+		SkipsLocalDocker: true,
+		Tag:              "tilt-build",
+	}
+
+	manifest := manifestbuilder.New(f, "sancho").
+		WithK8sYAML(SanchoYAML).
+		WithImageTarget(model.MustNewImageTarget(SanchoRef).WithBuildDetails(cb)).
+		Build()
+
+	_, err := f.ibd.BuildAndDeploy(f.ctx, f.st, buildTargets(manifest), store.BuildStateSet{})
+	assert.NoError(t, err)
+
+	// We didn't try to build, tag, or push an image
+	assert.Equal(t, 0, f.docker.BuildCount)
+	assert.Equal(t, 0, f.docker.TagCount)
+	assert.Equal(t, 0, f.kl.loadCount)
+	assert.Equal(t, 0, f.docker.PushCount)
+}
+
+func TestBuildAndDeployUsesCorrectRef(t *testing.T) {
 	expectedImages := []string{"foo.com/gcr.io_some-project-162817_sancho"}
+	expectedImagesClusterRef := []string{"registry:1234/gcr.io_some-project-162817_sancho"}
 	tests := []struct {
 		name           string
 		manifest       func(f Fixture) model.Manifest
-		expectedImages []string
+		withClusterRef bool // if true, clusterRef != localRef, i.e. ref of the built docker image != ref injected into YAML
+		expectBuilt    []string
+		expectDeployed []string
 	}{
-		{"docker build", func(f Fixture) model.Manifest { return NewSanchoDockerBuildManifest(f) }, expectedImages},
-		{"fast build", NewSanchoFastBuildManifest, expectedImages},
-		{"custom build", NewSanchoCustomBuildManifest, expectedImages},
-		{"live multi stage", NewSanchoLiveUpdateMultiStageManifest, append(expectedImages, "foo.com/sancho-base")},
+		{"docker build", func(f Fixture) model.Manifest { return NewSanchoDockerBuildManifest(f) }, false, expectedImages, expectedImages},
+		{"docker build + distinct clusterRef", func(f Fixture) model.Manifest { return NewSanchoDockerBuildManifest(f) }, true, expectedImages, expectedImagesClusterRef},
+		{"custom build", NewSanchoCustomBuildManifest, false, expectedImages, expectedImages},
+		{"custom build + distinct clusterRef", NewSanchoCustomBuildManifest, true, expectedImages, expectedImagesClusterRef},
+		{"live multi stage", NewSanchoLiveUpdateMultiStageManifest, false, append(expectedImages, "foo.com/sancho-base"), expectedImages},
+		{"live multi stage + distinct clusterRef", NewSanchoLiveUpdateMultiStageManifest, true, append(expectedImages, "foo.com/sancho-base"), expectedImagesClusterRef},
 	}
 
 	for _, test := range tests {
@@ -381,18 +439,18 @@ func TestDeployUsesInjectRef(t *testing.T) {
 			f := newIBDFixture(t, k8s.EnvGKE)
 			defer f.TearDown()
 
-			if test.name == "custom build" {
+			if strings.Contains(test.name, "custom build") {
 				sha := digest.Digest("sha256:11cd0eb38bc3ceb958ffb2f9bd70be3fb317ce7d255c8a4c3f4af30e298aa1aab")
 				f.docker.Images["foo.com/gcr.io_some-project-162817_sancho:tilt-build-1546304461"] = types.ImageInspect{ID: string(sha)}
 			}
 
 			manifest := test.manifest(f)
-			var err error
 			for i := range manifest.ImageTargets {
-				manifest.ImageTargets[i].DeploymentRef, err = container.ReplaceRegistry("foo.com", manifest.ImageTargets[i].ConfigurationRef)
-				if err != nil {
-					t.Fatal(err)
+				reg := container.MustNewRegistry("foo.com")
+				if test.withClusterRef {
+					reg = container.MustNewRegistryWithHostFromCluster("foo.com", "registry:1234")
 				}
+				manifest.ImageTargets[i].Refs = manifest.ImageTargets[i].Refs.MustWithRegistry(reg)
 			}
 
 			result, err := f.ibd.BuildAndDeploy(f.ctx, f.st, buildTargets(manifest), store.BuildStateSet{})
@@ -403,10 +461,15 @@ func TestDeployUsesInjectRef(t *testing.T) {
 			var observedImages []string
 			for i := range manifest.ImageTargets {
 				id := manifest.ImageTargets[i].ID()
-				observedImages = append(observedImages, result[id].Image.Name())
+				image := store.LocalImageRefFromBuildResult(result[id])
+				observedImages = append(observedImages, image.Name())
 			}
 
-			assert.ElementsMatch(t, test.expectedImages, observedImages)
+			assert.ElementsMatch(t, test.expectBuilt, observedImages)
+
+			for _, expected := range test.expectDeployed {
+				assert.Contains(t, f.k8s.Yaml, expected)
+			}
 		})
 	}
 }
@@ -484,7 +547,65 @@ func TestDeployInjectsOverrideCommand(t *testing.T) {
 	assert.Empty(t, c.Args)
 }
 
-func TestDeployInjectOverrideCommandClearsOldCommandAndArgs(t *testing.T) {
+func (f *ibdFixture) firstPodTemplateSpecHash() k8s.PodTemplateSpecHash {
+	entities, err := k8s.ParseYAMLFromString(f.k8s.Yaml)
+	if err != nil {
+		f.T().Fatal(err)
+	}
+
+	// if you want to use this from a test that applies more than one entity, it will have to change
+	require.Equal(f.T(), 1, len(entities), "expected only one entity. Yaml contained: %s", f.k8s.Yaml)
+
+	require.IsType(f.T(), &v1.Deployment{}, entities[0].Obj)
+	d := entities[0].Obj.(*v1.Deployment)
+	ret := k8s.PodTemplateSpecHash(d.Spec.Template.Labels[k8s.TiltPodTemplateHashLabel])
+	require.NotEqual(f.T(), ret, k8s.PodTemplateSpecHash(""))
+	return ret
+}
+
+func TestDeployInjectsPodTemplateSpecHash(t *testing.T) {
+	f := newIBDFixture(t, k8s.EnvGKE)
+	defer f.TearDown()
+
+	manifest := NewSanchoDockerBuildManifest(f)
+
+	resultSet, err := f.ibd.BuildAndDeploy(f.ctx, f.st, buildTargets(manifest), store.BuildStateSet{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hash := f.firstPodTemplateSpecHash()
+
+	require.True(t, resultSet.DeployedPodTemplateSpecHashes().Contains(hash))
+}
+
+func TestDeployPodTemplateSpecHashChangesWhenImageChanges(t *testing.T) {
+	f := newIBDFixture(t, k8s.EnvGKE)
+	defer f.TearDown()
+
+	manifest := NewSanchoDockerBuildManifest(f)
+
+	_, err := f.ibd.BuildAndDeploy(f.ctx, f.st, buildTargets(manifest), store.BuildStateSet{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hash1 := f.firstPodTemplateSpecHash()
+
+	// now change the image digest and build again
+	f.docker.BuildOutput = docker.ExampleBuildOutput2
+
+	_, err = f.ibd.BuildAndDeploy(f.ctx, f.st, buildTargets(manifest), store.BuildStateSet{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hash2 := f.firstPodTemplateSpecHash()
+
+	require.NotEqual(t, hash1, hash2)
+}
+
+func TestDeployInjectOverrideCommandClearsOldCommandButNotArgs(t *testing.T) {
 	f := newIBDFixture(t, k8s.EnvGKE)
 	defer f.TearDown()
 
@@ -514,7 +635,41 @@ func TestDeployInjectOverrideCommandClearsOldCommandAndArgs(t *testing.T) {
 
 	c := d.Spec.Template.Spec.Containers[0]
 	assert.Equal(t, cmd.Argv, c.Command)
-	assert.Empty(t, c.Args)
+	assert.Equal(t, []string{"something", "something_else"}, c.Args)
+}
+
+func TestDeployInjectOverrideCommandAndArgs(t *testing.T) {
+	f := newIBDFixture(t, k8s.EnvGKE)
+	defer f.TearDown()
+
+	cmd := model.ToShellCmd("./foo.sh bar")
+	manifest := NewSanchoDockerBuildManifestWithYaml(f, testyaml.SanchoYAMLWithCommand)
+	iTarg := manifest.ImageTargetAt(0).WithOverrideCommand(cmd)
+	iTarg.OverrideArgs = model.OverrideArgs{ShouldOverride: true}
+	manifest = manifest.WithImageTarget(iTarg)
+
+	_, err := f.ibd.BuildAndDeploy(f.ctx, f.st, buildTargets(manifest), store.BuildStateSet{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entities, err := k8s.ParseYAMLFromString(f.k8s.Yaml)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !assert.Equal(t, 1, len(entities)) {
+		return
+	}
+
+	d := entities[0].Obj.(*v1.Deployment)
+	if !assert.Equal(t, 1, len(d.Spec.Template.Spec.Containers)) {
+		return
+	}
+
+	c := d.Spec.Template.Spec.Containers[0]
+	assert.Equal(t, cmd.Argv, c.Command)
+	assert.Equal(t, []string(nil), c.Args)
 }
 
 func TestCantInjectOverrideCommandWithoutContainer(t *testing.T) {
@@ -585,7 +740,7 @@ func TestIBDDeployUIDs(t *testing.T) {
 	f := newIBDFixture(t, k8s.EnvGKE)
 	defer f.TearDown()
 
-	manifest := NewSanchoFastBuildManifest(f)
+	manifest := NewSanchoDockerBuildManifest(f)
 	result, err := f.ibd.BuildAndDeploy(f.ctx, f.st, buildTargets(manifest), store.BuildStateSet{})
 	if err != nil {
 		t.Fatal(err)
@@ -622,7 +777,7 @@ type ibdFixture struct {
 	k8s    *k8s.FakeK8sClient
 	ibd    *ImageBuildAndDeployer
 	st     *store.TestingStore
-	kp     *fakeKINDPusher
+	kl     *fakeKINDLoader
 }
 
 func newIBDFixture(t *testing.T, env k8s.Env) *ibdFixture {
@@ -631,9 +786,9 @@ func newIBDFixture(t *testing.T, env k8s.Env) *ibdFixture {
 	docker := docker.NewFakeClient()
 	ctx, _, ta := testutils.CtxAndAnalyticsForTest()
 	kClient := k8s.NewFakeK8sClient()
-	kp := &fakeKINDPusher{}
+	kl := &fakeKINDLoader{}
 	clock := fakeClock{time.Date(2019, 1, 1, 1, 1, 1, 1, time.UTC)}
-	ibd, err := provideImageBuildAndDeployer(ctx, docker, kClient, env, dir, clock, kp, ta)
+	ibd, err := provideImageBuildAndDeployer(ctx, docker, kClient, env, dir, clock, kl, ta)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -644,7 +799,7 @@ func newIBDFixture(t *testing.T, env k8s.Env) *ibdFixture {
 		k8s:            kClient,
 		ibd:            ibd,
 		st:             store.NewTestingStore(),
-		kp:             kp,
+		kl:             kl,
 	}
 }
 
@@ -653,11 +808,20 @@ func (f *ibdFixture) TearDown() {
 	f.TempDirFixture.TearDown()
 }
 
-type fakeKINDPusher struct {
-	pushCount int
+func (f *ibdFixture) replaceRegistry(defaultReg string, sel container.RefSelector) reference.Named {
+	reg := container.MustNewRegistry(defaultReg)
+	named, err := reg.ReplaceRegistryForLocalRef(sel)
+	if err != nil {
+		f.T().Fatal(err)
+	}
+	return named
 }
 
-func (kp *fakeKINDPusher) PushToKIND(ctx context.Context, ref reference.NamedTagged, w io.Writer) error {
-	kp.pushCount++
+type fakeKINDLoader struct {
+	loadCount int
+}
+
+func (kl *fakeKINDLoader) LoadToKIND(ctx context.Context, ref reference.NamedTagged) error {
+	kl.loadCount++
 	return nil
 }

@@ -3,24 +3,26 @@ package k8swatch
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 
+	"github.com/windmilleng/tilt/internal/k8s"
 	"github.com/windmilleng/tilt/internal/k8s/testyaml"
+	"github.com/windmilleng/tilt/internal/store"
 	"github.com/windmilleng/tilt/internal/testutils"
 	"github.com/windmilleng/tilt/internal/testutils/manifestbuilder"
 	"github.com/windmilleng/tilt/internal/testutils/podbuilder"
 	"github.com/windmilleng/tilt/internal/testutils/tempdir"
-
-	"github.com/windmilleng/tilt/internal/k8s"
-	"github.com/windmilleng/tilt/internal/store"
 	"github.com/windmilleng/tilt/pkg/model"
-
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
 )
 
 func TestPodWatch(t *testing.T) {
@@ -69,6 +71,36 @@ func TestPodWatchChangeEventBeforeUID(t *testing.T) {
 	f.assertObservedPods(p)
 }
 
+// We had a bug where if newPod.resourceVersion < oldPod.resourceVersion (using string comparison!)
+// then we'd ignore the new pod. This meant, e.g., once we got an update for resourceVersion "9", we'd
+// ignore updates for resourceVersions "10" through "89" and "100" through "899"
+func TestPodWatchResourceVersionStringLessThan(t *testing.T) {
+	f := newPWFixture(t)
+	defer f.TearDown()
+
+	manifest := f.addManifestWithSelectors("server")
+
+	f.pw.OnChange(f.ctx, f.store)
+
+	ls := k8s.ManagedByTiltSelector()
+	pb := podbuilder.New(t, manifest).WithResourceVersion("9")
+
+	// Simulate the Deployment UID in the engine state
+	f.addDeployedUID(manifest, pb.DeploymentUID())
+	f.kClient.InjectEntityByName(pb.ObjectTreeEntities()...)
+
+	p1 := pb.Build()
+	f.kClient.EmitPod(ls, p1)
+
+	f.assertObservedPods(p1)
+	f.assertWatchedSelectors(ls)
+
+	p2 := pb.WithResourceVersion("10").Build()
+	f.kClient.EmitPod(ls, p2)
+
+	f.assertObservedPods(p1, p2)
+}
+
 func TestPodWatchExtraSelectors(t *testing.T) {
 	f := newPWFixture(t)
 	defer f.TearDown()
@@ -88,7 +120,7 @@ func TestPodWatchExtraSelectors(t *testing.T) {
 	f.kClient.EmitPod(ls1, p)
 
 	f.assertObservedPods(p)
-	assert.Equal(t, []model.ManifestName{manifest.Name}, f.manifestNames)
+	f.assertObservedManifests(manifest.Name)
 }
 
 func TestPodWatchHandleSelectorChange(t *testing.T) {
@@ -146,6 +178,44 @@ func TestPodWatchHandleSelectorChange(t *testing.T) {
 
 	f.assertObservedPods(p4, p5)
 	assert.Equal(t, []model.ManifestName{manifest2.Name, manifest2.Name}, f.manifestNames)
+}
+
+func TestPodsDispatchedInOrder(t *testing.T) {
+	f := newPWFixture(t)
+	defer f.TearDown()
+	manifest := f.addManifestWithSelectors("server")
+
+	f.pw.OnChange(f.ctx, f.store)
+
+	ls := k8s.ManagedByTiltSelector()
+	pb := podbuilder.New(t, manifest)
+
+	f.addDeployedUID(manifest, pb.DeploymentUID())
+	f.kClient.InjectEntityByName(pb.ObjectTreeEntities()...)
+
+	count := 20
+	pods := []*v1.Pod{}
+	for i := 0; i < count; i++ {
+		pod := pb.WithResourceVersion(fmt.Sprintf("%d", i)).Build()
+		pods = append(pods, pod)
+	}
+
+	for _, pod := range pods {
+		f.kClient.EmitPod(ls, pod)
+	}
+
+	f.waitForPodActionCount(count)
+
+	// Make sure the pods showed up in order.
+	for i := 1; i < count; i++ {
+		pod := f.pods[i]
+		lastPod := f.pods[i-1]
+		podV, _ := strconv.Atoi(pod.ResourceVersion)
+		lastPodV, _ := strconv.Atoi(lastPod.ResourceVersion)
+		if lastPodV > podV {
+			t.Fatalf("Pods appeared out of order\nPod %d: %v\nPod %d: %v\n", i-1, lastPod, i, pod)
+		}
+	}
 }
 
 type podStatusTestCase struct {
@@ -234,9 +304,13 @@ type pwFixture struct {
 	store         *store.Store
 	pods          []*corev1.Pod
 	manifestNames []model.ManifestName
+	mu            sync.Mutex
 }
 
 func (pw *pwFixture) reducer(ctx context.Context, state *store.EngineState, action store.Action) {
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+
 	a, ok := action.(PodChangeAction)
 	if !ok {
 		pw.t.Errorf("Expected action type PodLogAction. Actual: %T", action)
@@ -263,7 +337,10 @@ func newPWFixture(t *testing.T) *pwFixture {
 	}
 
 	st := store.NewStore(store.Reducer(ret.reducer), store.LogActionsFlag(false))
-	go st.Loop(ctx)
+	go func() {
+		err := st.Loop(ctx)
+		testutils.FailOnNonCanceledErr(t, err, "store.Loop failed")
+	}()
 
 	ret.store = st
 
@@ -289,17 +366,37 @@ func (f *pwFixture) addDeployedUID(m model.Manifest, uid types.UID) {
 	runtimeState.DeployedUIDSet[uid] = true
 }
 
+func (f *pwFixture) waitForPodActionCount(count int) {
+	start := time.Now()
+	for time.Since(start) < time.Second {
+		f.mu.Lock()
+		podCount := len(f.pods)
+		f.mu.Unlock()
+
+		if podCount >= count {
+			return
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	f.t.Fatalf("Timeout waiting for %d pod actions", count)
+}
+
 func (f *pwFixture) assertObservedPods(pods ...*corev1.Pod) {
+	f.waitForPodActionCount(len(pods))
+	require.ElementsMatch(f.t, pods, f.pods)
+}
+
+func (f *pwFixture) assertObservedManifests(manifests ...model.ManifestName) {
 	start := time.Now()
 	for time.Since(start) < 200*time.Millisecond {
-		if len(pods) == len(f.pods) {
+		if len(manifests) == len(f.manifestNames) {
 			break
 		}
 	}
 
-	if !assert.ElementsMatch(f.t, pods, f.pods) {
-		f.t.FailNow()
-	}
+	require.ElementsMatch(f.t, manifests, f.manifestNames)
 }
 
 func (f *pwFixture) assertWatchedSelectors(ls ...labels.Selector) {

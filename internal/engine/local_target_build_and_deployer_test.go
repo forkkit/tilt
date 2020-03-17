@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/windmilleng/tilt/internal/engine/buildcontrol"
 	"github.com/windmilleng/tilt/internal/testutils/tempdir"
 
 	"github.com/windmilleng/tilt/internal/store"
@@ -56,7 +57,7 @@ func TestSuccessfulCommand(t *testing.T) {
 	res, err := f.ltbad.BuildAndDeploy(f.ctx, f.st, []model.TargetSpec{targ}, store.BuildStateSet{})
 	require.Nil(t, err)
 
-	assert.Equal(t, targ.ID(), res[targ.ID()].TargetID)
+	assert.Equal(t, targ.ID(), res[targ.ID()].TargetID())
 
 	assert.Contains(t, f.out.String(), "hello world", "expect cmd stdout in logs")
 }
@@ -72,7 +73,7 @@ func TestWorkdir(t *testing.T) {
 	res, err := f.ltbad.BuildAndDeploy(f.ctx, f.st, []model.TargetSpec{targ}, store.BuildStateSet{})
 	require.Nil(t, err)
 
-	assert.Equal(t, targ.ID(), res[targ.ID()].TargetID)
+	assert.Equal(t, targ.ID(), res[targ.ID()].TargetID())
 
 	expectedOut := fmt.Sprintf("the directory is %s", workdir)
 	assert.Contains(t, f.out.String(), expectedOut, "expect cmd stdout (with appropriate pwd) in logs")
@@ -92,7 +93,7 @@ func TestExtractOneLocalTarget(t *testing.T) {
 	res, err := f.ltbad.BuildAndDeploy(f.ctx, f.st, specs, store.BuildStateSet{})
 	require.Nil(t, err)
 
-	assert.Equal(t, targ.ID(), res[targ.ID()].TargetID)
+	assert.Equal(t, targ.ID(), res[targ.ID()].TargetID())
 
 	assert.Contains(t, f.out.String(), "hello world", "expect cmd stdout in logs")
 }
@@ -109,7 +110,7 @@ func TestFailedCommand(t *testing.T) {
 	require.NotNil(t, err, "failed cmd should throw error")
 	assert.Contains(t, err.Error(),
 		"Command \"echo oh no; false\" failed: exit status 1")
-	assert.True(t, IsDontFallBackError(err), "expect DontFallBackError")
+	assert.True(t, buildcontrol.IsDontFallBackError(err), "expect DontFallBackError")
 
 	assert.Contains(t, f.out.String(), "oh no", "expect cmd stdout in logs")
 }
@@ -147,7 +148,7 @@ func (f *ltFixture) localTarget(cmd string) model.LocalTarget {
 
 func (f *ltFixture) localTargetWithWorkdir(cmd string, workdir string) model.LocalTarget {
 	return model.LocalTarget{
-		Cmd:     model.ToShellCmd(cmd),
-		Workdir: workdir,
+		UpdateCmd: model.ToShellCmd(cmd),
+		Workdir:   workdir,
 	}
 }

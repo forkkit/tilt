@@ -20,6 +20,7 @@ type ConfigsController struct {
 	tfl                tiltfile.TiltfileLoader
 	dockerClient       docker.Client
 	clock              func() time.Time
+	loadCount          int
 }
 
 func NewConfigsController(tfl tiltfile.TiltfileLoader, dockerClient docker.Client) *ConfigsController {
@@ -43,18 +44,25 @@ func (cc *ConfigsController) DisableForTesting(disabled bool) {
 // 2) There are pending file changes, and
 // 3) Those files have changed since the last Tiltfile build
 //    (so that we don't keep re-running a failed build)
+// 4) OR the command-line args have changed since the last Tiltfile build
 func (cc *ConfigsController) shouldBuild(state store.EngineState) bool {
 	isRunning := !state.TiltfileState.CurrentBuild.StartTime.IsZero()
 	if isRunning {
 		return false
 	}
 
+	lastStartTime := state.TiltfileState.LastBuild().StartTime
+
 	for _, changeTime := range state.PendingConfigFileChanges {
-		lastStartTime := state.TiltfileState.LastBuild().StartTime
 		if changeTime.After(lastStartTime) {
 			return true
 		}
 	}
+
+	if state.UserConfigState.ArgsChangeTime.After(lastStartTime) {
+		return true
+	}
+
 	return false
 }
 
@@ -73,54 +81,65 @@ func logTiltfileChanges(ctx context.Context, filesChanged map[string]bool) {
 }
 
 func (cc *ConfigsController) loadTiltfile(ctx context.Context, st store.RStore,
-	initManifests []model.ManifestName, filesChanged map[string]bool, tiltfilePath string) {
+	filesChanged map[string]bool, argsChanged bool, tiltfilePath string, loadCount int) {
 
 	startTime := cc.clock()
-	st.Dispatch(ConfigsReloadStartedAction{FilesChanged: filesChanged, StartTime: startTime})
+	st.Dispatch(ConfigsReloadStartedAction{
+		FilesChanged: filesChanged,
+		StartTime:    startTime,
+		SpanID:       SpanIDForLoadCount(loadCount),
+	})
 
-	matching := map[string]bool{}
-	for _, m := range initManifests {
-		matching[string(m)] = true
-	}
-
-	actionWriter := NewTiltfileLogWriter(st)
-	ctx = logger.WithLogger(ctx, logger.NewLogger(logger.Get(ctx).Level(), actionWriter))
+	actionWriter := NewTiltfileLogWriter(st, loadCount)
+	ctx = logger.CtxWithLogHandler(ctx, actionWriter)
 
 	state := st.RLockState()
-	globalLogLineCountAtExecStart := state.Log.LineCount()
+	checkpointAtExecStart := state.LogStore.Checkpoint()
 	firstBuild := !state.TiltfileState.StartedFirstBuild()
 	if !firstBuild {
 		logTiltfileChanges(ctx, filesChanged)
 	}
+	userConfigState := state.UserConfigState
+	if argsChanged {
+		logger.Get(ctx).Infof("Tiltfile args changed to: %v", userConfigState.Args)
+	}
 	st.RUnlockState()
 
-	tlr := cc.tfl.Load(ctx, tiltfilePath, matching)
+	tlr := cc.tfl.Load(ctx, tiltfilePath, userConfigState)
 	if tlr.Error == nil && len(tlr.Manifests) == 0 {
 		tlr.Error = fmt.Errorf("No resources found. Check out https://docs.tilt.dev/tutorial.html to get started!")
-	}
-	if tlr.Error != nil {
-		logger.Get(ctx).Infof(tlr.Error.Error())
 	}
 
 	if tlr.Orchestrator() != model.OrchestratorUnknown {
 		cc.dockerClient.SetOrchestrator(tlr.Orchestrator())
+	}
+
+	if requiresDocker(tlr) {
 		dockerErr := cc.dockerClient.CheckConnected()
 		if tlr.Error == nil && dockerErr != nil {
 			tlr.Error = errors.Wrap(dockerErr, "Failed to connect to Docker")
 		}
 	}
 
+	if tlr.Error != nil {
+		logger.Get(ctx).Infof(tlr.Error.Error())
+	}
+
 	st.Dispatch(ConfigsReloadedAction{
-		Manifests:                     tlr.Manifests,
-		ConfigFiles:                   tlr.ConfigFiles,
-		TiltIgnoreContents:            tlr.TiltIgnoreContents,
-		FinishTime:                    cc.clock(),
-		Err:                           tlr.Error,
-		Warnings:                      tlr.Warnings,
-		Features:                      tlr.FeatureFlags,
-		TeamName:                      tlr.TeamName,
-		Secrets:                       tlr.Secrets,
-		GlobalLogLineCountAtExecStart: globalLogLineCountAtExecStart,
+		Manifests:             tlr.Manifests,
+		ConfigFiles:           tlr.ConfigFiles,
+		TiltIgnoreContents:    tlr.TiltIgnoreContents,
+		FinishTime:            cc.clock(),
+		Err:                   tlr.Error,
+		Features:              tlr.FeatureFlags,
+		TeamName:              tlr.TeamName,
+		TelemetrySettings:     tlr.TelemetrySettings,
+		Secrets:               tlr.Secrets,
+		AnalyticsTiltfileOpt:  tlr.AnalyticsOpt,
+		DockerPruneSettings:   tlr.DockerPruneSettings,
+		CheckpointAtExecStart: checkpointAtExecStart,
+		VersionSettings:       tlr.VersionSettings,
+		UpdateSettings:        tlr.UpdateSettings,
 	})
 }
 
@@ -132,7 +151,6 @@ func (cc *ConfigsController) OnChange(ctx context.Context, st store.RStore) {
 	state := st.RLockState()
 	defer st.RUnlockState()
 
-	initManifests := state.InitManifests
 	if !cc.shouldBuild(state) {
 		return
 	}
@@ -142,6 +160,8 @@ func (cc *ConfigsController) OnChange(ctx context.Context, st store.RStore) {
 		filesChanged[k] = true
 	}
 
+	argsChanged := state.UserConfigState.ArgsChangeTime.After(state.TiltfileState.LastBuild().StartTime)
+
 	tiltfilePath, err := state.RelativeTiltfilePath()
 	if err != nil {
 		st.Dispatch(store.NewErrorAction(err))
@@ -149,5 +169,24 @@ func (cc *ConfigsController) OnChange(ctx context.Context, st store.RStore) {
 	}
 
 	// Release the state lock and load the tiltfile in a separate goroutine
-	go cc.loadTiltfile(ctx, st, initManifests, filesChanged, tiltfilePath)
+	cc.loadCount++
+
+	loadCount := cc.loadCount
+	go cc.loadTiltfile(ctx, st, filesChanged, argsChanged, tiltfilePath, loadCount)
+}
+
+func requiresDocker(tlr tiltfile.TiltfileLoadResult) bool {
+	if tlr.Orchestrator() == model.OrchestratorDC {
+		return true
+	}
+
+	for _, m := range tlr.Manifests {
+		for _, iTarget := range m.ImageTargets {
+			if iTarget.IsDockerBuild() {
+				return true
+			}
+		}
+	}
+
+	return false
 }

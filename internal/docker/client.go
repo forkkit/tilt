@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	cliflags "github.com/docker/cli/cli/flags"
 	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/registry"
 	"github.com/docker/go-connections/tlsconfig"
@@ -28,8 +30,20 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/windmilleng/tilt/internal/container"
+	"github.com/windmilleng/tilt/internal/docker/buildkit"
 	"github.com/windmilleng/tilt/pkg/logger"
 	"github.com/windmilleng/tilt/pkg/model"
+)
+
+// Label that we attach to all of the images we build.
+const (
+	BuiltByLabel = "builtby"
+	BuiltByValue = "tilt"
+)
+
+var (
+	BuiltByTiltLabel    = map[string]string{BuiltByLabel: BuiltByValue}
+	BuiltByTiltLabelStr = fmt.Sprintf("%s=%s", BuiltByLabel, BuiltByValue)
 )
 
 // Version info
@@ -88,6 +102,10 @@ type Client interface {
 	ImageInspectWithRaw(ctx context.Context, imageID string) (types.ImageInspect, []byte, error)
 	ImageList(ctx context.Context, options types.ImageListOptions) ([]types.ImageSummary, error)
 	ImageRemove(ctx context.Context, imageID string, options types.ImageRemoveOptions) ([]types.ImageDeleteResponseItem, error)
+
+	NewVersionError(APIrequired, feature string) error
+	BuildCachePrune(ctx context.Context, opts types.BuildCachePruneOptions) (*types.BuildCachePruneReport, error)
+	ContainersPrune(ctx context.Context, pruneFilters filters.Args) (types.ContainersPruneReport, error)
 }
 
 type ExitError struct {
@@ -119,6 +137,10 @@ type Cli struct {
 }
 
 func NewDockerClient(ctx context.Context, env Env) Client {
+	if env.Error != nil {
+		return newExplodingClient(env.Error)
+	}
+
 	opts, err := CreateClientOpts(ctx, env)
 	if err != nil {
 		return newExplodingClient(err)
@@ -226,8 +248,8 @@ func SupportsBuildkit(v types.Version, env Env) bool {
 // DOCKER_API_VERSION to set the version of the API to reach, leave empty for latest.
 // DOCKER_CERT_PATH to load the TLS certificates from.
 // DOCKER_TLS_VERIFY to enable or disable TLS verification, off by default.
-func CreateClientOpts(ctx context.Context, env Env) ([]func(client *client.Client) error, error) {
-	result := make([]func(client *client.Client) error, 0)
+func CreateClientOpts(ctx context.Context, env Env) ([]client.Opt, error) {
+	result := make([]client.Opt, 0)
 
 	if env.CertPath != "" {
 		options := tlsconfig.Options{
@@ -254,24 +276,57 @@ func CreateClientOpts(ctx context.Context, env Env) ([]func(client *client.Clien
 	if env.APIVersion != "" {
 		result = append(result, client.WithVersion(env.APIVersion))
 	} else {
-		// NegotateAPIVersion makes the docker client negotiate down to a lower version
-		// if 'defaultVersion' is newer than the server version.
-		result = append(result, client.WithVersion(defaultVersion), NegotiateAPIVersion(ctx))
+		// WithAPIVersionNegotiation makes the Docker client negotiate down to a lower
+		// version if Docker's current API version is newer than the server version.
+		result = append(result, client.WithAPIVersionNegotiation())
 	}
 
 	return result, nil
 }
 
-func NegotiateAPIVersion(ctx context.Context) func(client *client.Client) error {
-	return func(client *client.Client) error {
-		client.NegotiateAPIVersion(ctx)
-		return nil
-	}
-}
-
 type dockerCreds struct {
 	authConfigs map[string]types.AuthConfig
 	sessionID   string
+}
+
+func (c *Cli) startBuildkitSession(ctx context.Context, key string, sshSpecs []string, secretSpecs []string) (*session.Session, error) {
+	session, err := session.NewSession(ctx, "tilt", key)
+	if err != nil {
+		return nil, err
+
+	}
+
+	provider := authprovider.NewDockerAuthProvider(logger.Get(ctx).Writer(logger.InfoLvl))
+	session.Allow(provider)
+
+	if len(secretSpecs) > 0 {
+		ss, err := buildkit.ParseSecretSpecs(secretSpecs)
+		if err != nil {
+			return nil, errors.Wrapf(err, "could not parse secret: %v", secretSpecs)
+		}
+		session.Allow(ss)
+	}
+
+	if len(sshSpecs) > 0 {
+		sshp, err := buildkit.ParseSSHSpecs(sshSpecs)
+		if err != nil {
+			return nil, errors.Wrapf(err, "could not parse ssh: %v", sshSpecs)
+		}
+		session.Allow(sshp)
+	}
+
+	go func() {
+		defer func() {
+			_ = session.Close()
+		}()
+
+		// Start the server
+		dialSession := func(ctx context.Context, proto string, meta map[string][]string) (net.Conn, error) {
+			return c.Client.DialHijack(ctx, "/session", proto, meta)
+		}
+		_ = session.Run(ctx, dialSession)
+	}()
+	return session, nil
 }
 
 // When we pull from a private docker registry, we have to get credentials
@@ -292,17 +347,10 @@ func (c *Cli) initCreds(ctx context.Context) dockerCreds {
 	creds := dockerCreds{}
 
 	if c.builderVersion == types.BuilderBuildKit {
-		session, _ := session.NewSession(ctx, "tilt", sessionSharedKey)
-		if session != nil {
-			session.Allow(authprovider.NewDockerAuthProvider())
-			go func() {
-				defer func() {
-					_ = session.Close()
-				}()
-
-				// Start the server
-				_ = session.Run(ctx, c.Client.DialSession)
-			}()
+		session, err := c.startBuildkitSession(ctx, sessionSharedKey, nil, nil)
+		if err != nil {
+			logger.Get(ctx).Warnf("Docker BuildKit session failed to init: %v", err)
+		} else if session != nil {
 			creds.sessionID = session.ID()
 		}
 	} else {
@@ -311,7 +359,11 @@ func (c *Cli) initCreds(ctx context.Context) dockerCreds {
 		// If we fail to get credentials for some reason, that's OK.
 		// even the docker CLI ignores this:
 		// https://github.com/docker/cli/blob/23446275646041f9b598d64c51be24d5d0e49376/cli/command/image/build.go#L386
-		authConfigs, _ := configFile.GetAllCredentials()
+		credentials, _ := configFile.GetAllCredentials()
+		authConfigs := make(map[string]types.AuthConfig, len(credentials))
+		for k, auth := range credentials {
+			authConfigs[k] = types.AuthConfig(auth)
+		}
 		creds.authConfigs = authConfigs
 	}
 
@@ -370,7 +422,13 @@ func (c *Cli) ImagePush(ctx context.Context, ref reference.NamedTagged) (io.Read
 
 	logger.Get(ctx).Infof("Authenticating to image repo: %s", repoInfo.Index.Name)
 	infoWriter := logger.Get(ctx).Writer(logger.InfoLvl)
-	cli := command.NewDockerCli(nil, infoWriter, infoWriter, true)
+	cli, err := command.NewDockerCli(
+		command.WithCombinedStreams(infoWriter),
+		command.WithContentTrust(true),
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "ImagePush#NewDockerCli")
+	}
 
 	err = cli.Initialize(cliflags.NewClientOptions())
 	if err != nil {
@@ -403,18 +461,48 @@ func (c *Cli) ImageBuild(ctx context.Context, buildContext io.Reader, options Bu
 		logger.Get(ctx).Verbosef("%v", c.initError)
 	}
 
+	var oneTimeSession *session.Session
+	sessionID := c.creds.sessionID
+	if len(options.SSHSpecs) > 0 || len(options.SecretSpecs) > 0 {
+		if c.builderVersion != types.BuilderBuildKit {
+			return types.ImageBuildResponse{},
+				fmt.Errorf("Docker SSH secrets only work on Buildkit, but Buildkit has been disabled")
+		}
+
+		var err error
+		oneTimeSession, err = c.startBuildkitSession(ctx, identity.NewID(), options.SSHSpecs, options.SecretSpecs)
+		if err != nil {
+			return types.ImageBuildResponse{}, errors.Wrapf(err, "ImageBuild")
+		}
+		sessionID = oneTimeSession.ID()
+	}
+
 	opts := types.ImageBuildOptions{}
 	opts.Version = c.builderVersion
 	opts.AuthConfigs = c.creds.authConfigs
-	opts.SessionID = c.creds.sessionID
+	opts.SessionID = sessionID
 	opts.Remove = options.Remove
 	opts.Context = options.Context
 	opts.BuildArgs = options.BuildArgs
 	opts.Dockerfile = options.Dockerfile
-	opts.Tags = options.Tags
+	opts.Tags = append([]string{}, options.ExtraTags...)
 	opts.Target = options.Target
+	opts.NetworkMode = options.Network
 
-	return c.Client.ImageBuild(ctx, buildContext, opts)
+	opts.Labels = BuiltByTiltLabel // label all images as built by us
+
+	response, err := c.Client.ImageBuild(ctx, buildContext, opts)
+	if err != nil {
+		if oneTimeSession != nil {
+			_ = oneTimeSession.Close()
+		}
+		return response, err
+	}
+
+	if oneTimeSession != nil {
+		response.Body = WrapReadCloserWithTearDown(response.Body, oneTimeSession.Close)
+	}
+	return response, err
 }
 
 func (c *Cli) CopyToContainerRoot(ctx context.Context, container string, content io.Reader) error {

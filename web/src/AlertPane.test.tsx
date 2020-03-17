@@ -1,16 +1,21 @@
 import React from "react"
 import AlertPane from "./AlertPane"
 import renderer from "react-test-renderer"
-import { oneResourceUnrecognizedError } from "./testdata.test"
-import { Resource, TriggerMode } from "./types"
-import { getResourceAlerts } from "./alerts"
+import { oneResourceUnrecognizedError } from "./testdata"
+import { TriggerMode } from "./types"
 import PathBuilder from "./PathBuilder"
 import { mount } from "enzyme"
+import LogStore from "./LogStore"
+
+type Resource = Proto.webviewResource
+
+let logStore = new LogStore()
 
 let pb = new PathBuilder("localhost", "")
 beforeEach(() => {
   fetchMock.resetMocks()
   Date.now = jest.fn(() => 1482363367071)
+  logStore = new LogStore()
 })
 
 it("renders no errors", () => {
@@ -19,7 +24,11 @@ it("renders no errors", () => {
 
   const tree = renderer
     .create(
-      <AlertPane pathBuilder={pb} resources={resources as Array<Resource>} />
+      <AlertPane
+        pathBuilder={pb}
+        resources={resources as Array<Resource>}
+        logStore={logStore}
+      />
     )
     .toJSON()
 
@@ -30,35 +39,40 @@ it("renders one container start error", () => {
   const ts = "1,555,970,585,039"
 
   let resource = fillResourceFields()
-  resource.CrashLog = "Eeeeek there is a problem"
-  resource.BuildHistory = [
+  resource.crashLog = "Eeeeek there is a problem"
+  resource.buildHistory = [
     {
-      Log: "laa dee daa I'm not an error\nI'm serious",
-      FinishTime: ts,
-      Error: null,
+      finishTime: ts,
     },
   ]
-  if (!resource.K8sResourceInfo) throw new Error("Missing k8s info")
-  resource.K8sResourceInfo.PodCreationTime = ts
-  resource.K8sResourceInfo.PodStatus = "Error"
-  resource.K8sResourceInfo.PodRestarts = 2
-  resource.Alerts = getResourceAlerts(resource)
+  if (!resource.k8sResourceInfo) throw new Error("Missing k8s info")
+  resource.k8sResourceInfo.podCreationTime = ts
+  resource.k8sResourceInfo.podStatus = "Error"
+  resource.k8sResourceInfo.podRestarts = 2
 
   let resources = [resource]
 
   const tree = renderer
     .create(
-      <AlertPane pathBuilder={pb} resources={resources as Array<Resource>} />
+      <AlertPane
+        pathBuilder={pb}
+        resources={resources as Array<Resource>}
+        logStore={logStore}
+      />
     )
     .toJSON()
   expect(tree).toMatchSnapshot()
 
   // the podStatus will flap between "Error" and "CrashLoopBackOff"
-  resource.K8sResourceInfo.PodStatus = "CrashLoopBackOff"
-  resource.K8sResourceInfo.PodRestarts = 3
+  resource.k8sResourceInfo.podStatus = "CrashLoopBackOff"
+  resource.k8sResourceInfo.podRestarts = 3
   const newTree = renderer
     .create(
-      <AlertPane pathBuilder={pb} resources={resources as Array<Resource>} />
+      <AlertPane
+        pathBuilder={pb}
+        resources={resources as Array<Resource>}
+        logStore={logStore}
+      />
     )
     .toJSON()
   expect(newTree).toMatchSnapshot()
@@ -67,18 +81,19 @@ it("renders one container start error", () => {
 it("renders pod restart dismiss button", () => {
   let resource = fillResourceFields()
   const ts = "1,555,970,585,039"
-  resource.CrashLog = "Eeeeek there is a problem"
-  let rInfo = resource.K8sResourceInfo
+  resource.crashLog = "Eeeeek there is a problem"
+  let rInfo = resource.k8sResourceInfo
   if (!rInfo) throw new Error("Missing k8s info")
-  rInfo.PodName = "pod-name"
-  rInfo.PodCreationTime = ts
-  rInfo.PodStatus = "Running"
-  rInfo.PodRestarts = 2
-  resource.Alerts = getResourceAlerts(resource)
+  rInfo.podName = "pod-name"
+  rInfo.podCreationTime = ts
+  rInfo.podStatus = "Running"
+  rInfo.podRestarts = 2
 
   let resources: Array<Resource> = [resource]
 
-  let root = mount(<AlertPane pathBuilder={pb} resources={resources} />)
+  let root = mount(
+    <AlertPane pathBuilder={pb} resources={resources} logStore={logStore} />
+  )
   let button = root.find(".AlertPane-dismissButton")
   expect(button).toHaveLength(1)
   fetchMock.mockResponse(JSON.stringify({}))
@@ -99,24 +114,25 @@ it("renders pod restart dismiss button", () => {
 it("shows that a container has restarted", () => {
   const ts = "1,555,970,585,039"
   let resource = fillResourceFields()
-  resource.CrashLog = "Eeeeek the container crashed"
-  resource.BuildHistory = [
+  resource.crashLog = "Eeeeek the container crashed"
+  resource.buildHistory = [
     {
-      Log: "laa dee daa I'm not an error\nseriously",
-      FinishTime: ts,
-      Error: null,
+      finishTime: ts,
     },
   ]
-  if (!resource.K8sResourceInfo) throw new Error("missing k8s info")
-  resource.K8sResourceInfo.PodStatus = "ok"
-  resource.K8sResourceInfo.PodCreationTime = ts
-  resource.K8sResourceInfo.PodRestarts = 1
-  resource.Alerts = getResourceAlerts(resource)
+  if (!resource.k8sResourceInfo) throw new Error("missing k8s info")
+  resource.k8sResourceInfo.podStatus = "ok"
+  resource.k8sResourceInfo.podCreationTime = ts
+  resource.k8sResourceInfo.podRestarts = 1
   let resources = [resource]
 
   const tree = renderer
     .create(
-      <AlertPane pathBuilder={pb} resources={resources as Array<Resource>} />
+      <AlertPane
+        pathBuilder={pb}
+        resources={resources as Array<Resource>}
+        logStore={logStore}
+      />
     )
     .toJSON()
   expect(tree).toMatchSnapshot()
@@ -125,25 +141,26 @@ it("shows that a container has restarted", () => {
 it("shows that a crash rebuild has occurred", () => {
   const ts = "1,555,970,585,039"
   let resource = fillResourceFields()
-  resource.CrashLog = "Eeeeek the container crashed"
-  resource.BuildHistory = [
+  resource.crashLog = "Eeeeek the container crashed"
+  resource.buildHistory = [
     {
-      Log: "laa dee daa I'm not an error\nseriously",
-      FinishTime: ts,
-      Error: null,
-      IsCrashRebuild: true,
+      finishTime: ts,
+      isCrashRebuild: true,
     },
   ]
-  if (!resource.K8sResourceInfo) throw new Error("missing k8s info")
-  resource.K8sResourceInfo.PodCreationTime = ts
-  resource.K8sResourceInfo.PodStatus = "ok"
-  resource.Alerts = getResourceAlerts(resource)
+  if (!resource.k8sResourceInfo) throw new Error("missing k8s info")
+  resource.k8sResourceInfo.podCreationTime = ts
+  resource.k8sResourceInfo.podStatus = "ok"
 
   let resources = [resource]
 
   const tree = renderer
     .create(
-      <AlertPane pathBuilder={pb} resources={resources as Array<Resource>} />
+      <AlertPane
+        pathBuilder={pb}
+        resources={resources as Array<Resource>}
+        logStore={logStore}
+      />
     )
     .toJSON()
   expect(tree).toMatchSnapshot()
@@ -153,25 +170,26 @@ it("renders multiple lines of a crash log", () => {
   const ts = "1,555,970,585,039"
 
   let resource = fillResourceFields()
-  resource.CrashLog = "Eeeeek the container crashed\nno but really it crashed"
-  resource.BuildHistory = [
+  resource.crashLog = "Eeeeek the container crashed\nno but really it crashed"
+  resource.buildHistory = [
     {
-      Log: "laa dee daa I'm not an error\nseriously",
-      FinishTime: ts,
-      Error: null,
-      IsCrashRebuild: true,
+      finishTime: ts,
+      isCrashRebuild: true,
     },
   ]
-  if (!resource.K8sResourceInfo) throw new Error("missing k8s info")
-  resource.K8sResourceInfo.PodCreationTime = ts
-  resource.K8sResourceInfo.PodStatus = "ok"
-  resource.Alerts = getResourceAlerts(resource)
+  if (!resource.k8sResourceInfo) throw new Error("missing k8s info")
+  resource.k8sResourceInfo.podCreationTime = ts
+  resource.k8sResourceInfo.podStatus = "ok"
 
   let resources = [resource]
 
   const tree = renderer
     .create(
-      <AlertPane pathBuilder={pb} resources={resources as Array<Resource>} />
+      <AlertPane
+        pathBuilder={pb}
+        resources={resources as Array<Resource>}
+        logStore={logStore}
+      />
     )
     .toJSON()
   expect(tree).toMatchSnapshot()
@@ -180,26 +198,27 @@ it("renders multiple lines of a crash log", () => {
 it("renders warnings", () => {
   const ts = "1,555,970,585,039"
   let resource = fillResourceFields()
-  resource.CrashLog = "Eeeeek the container crashed"
-  resource.BuildHistory = [
+  resource.crashLog = "Eeeeek the container crashed"
+  resource.buildHistory = [
     {
-      Log: "laa dee daa I'm not an error\nseriously",
-      FinishTime: ts,
-      Error: null,
-      IsCrashRebuild: true,
-      Warnings: ["Hi I'm a warning"],
+      finishTime: ts,
+      isCrashRebuild: true,
+      warnings: ["Hi I'm a warning"],
     },
   ]
-  if (!resource.K8sResourceInfo) throw new Error("missing k8s info")
-  resource.K8sResourceInfo.PodCreationTime = ts
-  resource.K8sResourceInfo.PodStatus = "ok"
-  resource.Alerts = getResourceAlerts(resource)
+  if (!resource.k8sResourceInfo) throw new Error("missing k8s info")
+  resource.k8sResourceInfo.podCreationTime = ts
+  resource.k8sResourceInfo.podStatus = "ok"
 
   let resources = [resource]
 
   const tree = renderer
     .create(
-      <AlertPane pathBuilder={pb} resources={resources as Array<Resource>} />
+      <AlertPane
+        pathBuilder={pb}
+        resources={resources as Array<Resource>}
+        logStore={logStore}
+      />
     )
     .toJSON()
   expect(tree).toMatchSnapshot()
@@ -208,12 +227,13 @@ it("renders warnings", () => {
 it("renders one container unrecognized error", () => {
   const ts = "1,555,970,585,039"
   let resource = oneResourceUnrecognizedError()
-  resource.Alerts = getResourceAlerts(resource)
 
   let resources = [resource]
 
   const tree = renderer
-    .create(<AlertPane pathBuilder={pb} resources={resources} />)
+    .create(
+      <AlertPane pathBuilder={pb} resources={resources} logStore={logStore} />
+    )
     .toJSON()
   expect(tree).toMatchSnapshot()
 })
@@ -221,33 +241,30 @@ it("renders one container unrecognized error", () => {
 //TODO TFT: Create tests testing that button appears and URL appears
 function fillResourceFields(): Resource {
   return {
-    Name: "foo",
-    CombinedLog: "",
-    BuildHistory: [],
-    CrashLog: "",
-    CurrentBuild: 0,
-    DirectoriesWatched: [],
-    Endpoints: [],
-    PodID: "",
-    IsTiltfile: false,
-    LastDeployTime: "",
-    PathsWatched: [],
-    PendingBuildEdits: [],
-    PendingBuildReason: 0,
-    PendingBuildSince: "",
-    K8sResourceInfo: {
-      PodName: "",
-      PodCreationTime: "",
-      PodUpdateStartTime: "",
-      PodStatus: "",
-      PodStatusMessage: "",
-      PodRestarts: 0,
-      PodLog: "",
-      Endpoints: [],
+    name: "foo",
+    buildHistory: [],
+    crashLog: "",
+    directoriesWatched: [],
+    endpoints: [],
+    podID: "",
+    isTiltfile: false,
+    lastDeployTime: "",
+    pathsWatched: [],
+    pendingBuildEdits: [],
+    pendingBuildReason: 0,
+    pendingBuildSince: "",
+    k8sResourceInfo: {
+      podName: "",
+      podCreationTime: "",
+      podUpdateStartTime: "",
+      podStatus: "",
+      podStatusMessage: "",
+      podRestarts: 0,
     },
-    RuntimeStatus: "",
-    TriggerMode: TriggerMode.TriggerModeAuto,
-    HasPendingChanges: true,
-    Alerts: [],
+    runtimeStatus: "",
+    triggerMode: TriggerMode.TriggerModeAuto,
+    hasPendingChanges: true,
+    facets: [],
+    queued: false,
   }
 }

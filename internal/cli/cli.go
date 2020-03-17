@@ -3,13 +3,14 @@ package cli
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"github.com/windmilleng/tilt/internal/analytics"
+	"github.com/windmilleng/wmclient/pkg/analytics"
+
+	tiltanalytics "github.com/windmilleng/tilt/internal/analytics"
 	"github.com/windmilleng/tilt/internal/output"
 	"github.com/windmilleng/tilt/internal/tracer"
 
@@ -36,32 +37,43 @@ func logLevel(verbose, debug bool) logger.Level {
 func Execute() {
 	rootCmd := &cobra.Command{
 		Use:   "tilt",
-		Short: "tilt creates Kubernetes Live Deploys that reflect changes seconds after they’re made",
+		Short: "Multi-service development with no stress",
+		Long: `
+Tilt helps you develop your microservices locally.
+Run 'tilt up' to start working on your services in a complete dev environment
+configured for your team.
+
+Tilt watches your files for edits, automatically builds your container images,
+and applies any changes to bring your environment
+up-to-date in real-time. Think 'docker build && kubectl apply' or 'docker-compose up'.
+`,
 	}
 
-	a, err := initAnalytics(rootCmd)
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
+	addCommand(rootCmd, &upCmd{})
+	addCommand(rootCmd, &dockerCmd{})
+	addCommand(rootCmd, &doctorCmd{})
+	addCommand(rootCmd, newDownCmd())
+	addCommand(rootCmd, &versionCmd{})
+	addCommand(rootCmd, &dockerPruneCmd{})
+	addCommand(rootCmd, newArgsCmd())
 
-	addCommand(rootCmd, &upCmd{}, a)
-	addCommand(rootCmd, &dockerCmd{}, a)
-	addCommand(rootCmd, &doctorCmd{}, a)
-	addCommand(rootCmd, &downCmd{}, a)
-	addCommand(rootCmd, &demoCmd{}, a)
-	addCommand(rootCmd, &versionCmd{}, a)
+	rootCmd.AddCommand(analytics.NewCommand())
 	rootCmd.AddCommand(newKubectlCmd())
+	rootCmd.AddCommand(newDumpCmd(rootCmd))
+	rootCmd.AddCommand(newTriggerCmd())
+	rootCmd.AddCommand(newAlphaCmd())
 
-	globalFlags := rootCmd.PersistentFlags()
-	globalFlags.BoolVarP(&debug, "debug", "d", false, "Enable debug logging")
-	globalFlags.BoolVarP(&verbose, "verbose", "v", false, "Enable verbose logging")
-	globalFlags.BoolVar(&trace, "trace", false, "Enable tracing")
-	globalFlags.StringVar(&traceType, "traceBackend", "windmill", "Which tracing backend to use. Valid values are: 'windmill', 'lightstep', 'jaeger'")
-	globalFlags.IntVar(&klogLevel, "klog", 0, "Enable Kubernetes API logging. Uses klog v-levels (0-4 are debug logs, 5-9 are tracing logs)")
-	err = globalFlags.MarkHidden("klog")
-	if err != nil {
-		panic(err)
+	if len(os.Args) > 2 && os.Args[1] == "kubectl" {
+		// Hack in global flags from kubectl
+		flush := preKubectlCmdInit()
+		defer flush()
+	} else {
+		globalFlags := rootCmd.PersistentFlags()
+		globalFlags.BoolVarP(&debug, "debug", "d", false, "Enable debug logging")
+		globalFlags.BoolVarP(&verbose, "verbose", "v", false, "Enable verbose logging")
+		globalFlags.BoolVar(&trace, "trace", false, "Enable tracing")
+		globalFlags.StringVar(&traceType, "traceBackend", "windmill", "Which tracing backend to use. Valid values are: 'windmill', 'lightstep', 'jaeger'")
+		globalFlags.IntVar(&klogLevel, "klog", 0, "Enable Kubernetes API logging. Uses klog v-levels (0-4 are debug logs, 5-9 are tracing logs)")
 	}
 
 	if err := rootCmd.Execute(); err != nil {
@@ -75,21 +87,29 @@ type tiltCmd interface {
 	run(ctx context.Context, args []string) error
 }
 
-func preCommand(ctx context.Context, a *analytics.TiltAnalytics) (context.Context, func() error) {
+func preCommand(ctx context.Context) (context.Context, func() error) {
 	cleanup := func() error { return nil }
-	initKlog()
 	l := logger.NewLogger(logLevel(verbose, debug), os.Stdout)
 	ctx = logger.WithLogger(ctx, l)
-	ctx = analytics.WithAnalytics(ctx, a)
+
+	a, err := newAnalytics(l)
+	if err != nil {
+		l.Errorf("Fatal error initializing analytics: %v", err)
+		os.Exit(1)
+	}
+
+	ctx = tiltanalytics.WithAnalytics(ctx, a)
+
+	initKlog(l.Writer(logger.InfoLvl))
 
 	if trace {
 		backend, err := tracer.StringToTracerBackend(traceType)
 		if err != nil {
-			log.Printf("Warning: invalid tracer backend: %v", err)
+			l.Warnf("invalid tracer backend: %v", err)
 		}
 		cleanup, err = tracer.Init(ctx, backend)
 		if err != nil {
-			log.Printf("Warning: unable to initialize tracer: %s", err)
+			l.Warnf("unable to initialize tracer: %s", err)
 		}
 	}
 
@@ -103,7 +123,7 @@ func preCommand(ctx context.Context, a *analytics.TiltAnalytics) (context.Contex
 		cancel()
 
 		// If we get another SIGINT/SIGTERM, OR it takes too long for tilt to
-		// exit after cancelling context, just exit
+		// exit after canceling context, just exit
 		select {
 		case <-sigs:
 			l.Debugf("force quitting...")
@@ -117,10 +137,10 @@ func preCommand(ctx context.Context, a *analytics.TiltAnalytics) (context.Contex
 	return ctx, cleanup
 }
 
-func addCommand(parent *cobra.Command, child tiltCmd, a *analytics.TiltAnalytics) {
+func addCommand(parent *cobra.Command, child tiltCmd) {
 	cobraChild := child.register()
 	cobraChild.Run = func(_ *cobra.Command, args []string) {
-		ctx, cleanup := preCommand(context.Background(), a)
+		ctx, cleanup := preCommand(context.Background())
 
 		err := child.run(ctx, args)
 

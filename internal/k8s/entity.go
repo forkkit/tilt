@@ -4,12 +4,15 @@ import (
 	"fmt"
 	"net/url"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
+
+	"github.com/windmilleng/tilt/internal/kustomize"
 
 	"github.com/pkg/errors"
 	v1 "k8s.io/api/core/v1"
@@ -48,6 +51,26 @@ func (emptyMeta) SetNamespace(ns string)                      {}
 
 var _ k8sMeta = emptyMeta{}
 var _ k8sMeta = &metav1.ObjectMeta{}
+
+type entityList []K8sEntity
+
+func (l entityList) Len() int { return len(l) }
+func (l entityList) Less(i, j int) bool {
+	// Sort entities by the priority of their Kind
+	indexI := kustomize.TypeOrders[l[i].GVK().Kind]
+	indexJ := kustomize.TypeOrders[l[j].GVK().Kind]
+	if indexI != indexJ {
+		return indexI < indexJ
+	}
+	return i < j
+}
+func (l entityList) Swap(i, j int) { l[i], l[j] = l[j], l[i] }
+
+func SortedEntities(entities []K8sEntity) []K8sEntity {
+	entList := entityList(CopyEntities(entities))
+	sort.Stable(entList)
+	return []K8sEntity(entList)
+}
 
 func (e K8sEntity) ToObjectReference() v1.ObjectReference {
 	meta := e.meta()
@@ -199,25 +222,27 @@ func (e K8sEntity) DeepCopy() K8sEntity {
 	return NewK8sEntity(e.Obj.DeepCopyObject())
 }
 
-// EntitiesWithDependentsAndRest returns two lists of k8s entities: those that may have dependencies,
-// which we will therefore want to apply first (i.e. namespaces and CRDs -- e.g. trying to create a
-// pod in a nonexistent namespace causes an error); and the rest of the entities.
-func EntitiesWithDependentsAndRest(entities []K8sEntity) (withDependents, rest []K8sEntity) {
-	var ns []K8sEntity
-	var crd []K8sEntity
+func CopyEntities(entities []K8sEntity) []K8sEntity {
+	res := make([]K8sEntity, len(entities))
+	for i, e := range entities {
+		res[i] = e.DeepCopy()
+	}
+	return res
+}
 
+// MutableAndImmutableEntities returns two lists of k8s entities: mutable ones (that can simply be
+// `kubectl apply`'d), and immutable ones (such as jobs and pods, which will need to be `--force`'d).
+// (We assume input entities are already sorted in a safe order to apply -- see kustomize/ordering.go.)
+func MutableAndImmutableEntities(entities entityList) (mutable, immutable []K8sEntity) {
 	for _, e := range entities {
-		kind := e.GVK().Kind
-		if kind == "Namespace" {
-			ns = append(ns, e)
-		} else if kind == "CustomResourceDefinition" {
-			crd = append(crd, e)
-		} else {
-			rest = append(rest, e)
+		if e.ImmutableOnceCreated() {
+			immutable = append(immutable, e)
+			continue
 		}
+		mutable = append(mutable, e)
 	}
 
-	return append(ns, crd...), rest
+	return mutable, immutable
 }
 
 func ImmutableEntities(entities []K8sEntity) []K8sEntity {
@@ -368,5 +393,24 @@ func (e K8sEntity) HasNamespace(ns string) bool {
 
 func (e K8sEntity) HasKind(kind string) bool {
 	// TODO(maia): support kind aliases (e.g. "po" for "pod")
-	return strings.ToLower(e.GVK().Kind) == strings.ToLower(kind)
+	return strings.EqualFold(e.GVK().Kind, kind)
+}
+
+func NewNamespaceEntity(name string) K8sEntity {
+	yaml := fmt.Sprintf(`apiVersion: v1
+kind: Namespace
+metadata:
+  name: %s
+`, name)
+	entities, err := ParseYAMLFromString(yaml)
+
+	// Something is wrong with our format string; this is definitely on us
+	if err != nil {
+		panic(fmt.Sprintf("unexpected error making new namespace: %v", err))
+	} else if len(entities) != 1 {
+		// Something is wrong with our format string; this is definitely on us
+		panic(fmt.Sprintf(
+			"unexpected error making new namespace: got %d entities, expected exactly one", len(entities)))
+	}
+	return entities[0]
 }

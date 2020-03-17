@@ -51,9 +51,9 @@ func TestServiceWatch(t *testing.T) {
 
 // In many environments, we will get a Service change event
 // faster than the `kubectl apply` finishes. So we need to hold onto
-// the Service and dispatch an event when the UID returne by `kubectl apply`
+// the Service and dispatch an event when the UID returned by `kubectl apply`
 // shows up.
-func TestServiceWatchDeployIDDelayed(t *testing.T) {
+func TestServiceWatchUIDDelayed(t *testing.T) {
 	f := newSWFixture(t)
 	defer f.TearDown()
 
@@ -113,14 +113,16 @@ type swFixture struct {
 }
 
 func newSWFixture(t *testing.T) *swFixture {
+	nip := k8s.NodeIP("fakeip")
+
 	kClient := k8s.NewFakeK8sClient()
+	kClient.FakeNodeIP = nip
 
 	ctx, _, _ := testutils.CtxAndAnalyticsForTest()
 	ctx, cancel := context.WithCancel(ctx)
 
-	nip := k8s.NodeIP("fakeip")
 	of := k8s.ProvideOwnerFetcher(kClient)
-	sw := NewServiceWatcher(kClient, of, nip)
+	sw := NewServiceWatcher(kClient, of)
 
 	ret := &swFixture{
 		kClient: kClient,
@@ -132,7 +134,10 @@ func newSWFixture(t *testing.T) *swFixture {
 	}
 
 	ret.store, ret.getActions = store.NewStoreForTesting()
-	go ret.store.Loop(ctx)
+	go func() {
+		err := ret.store.Loop(ctx)
+		testutils.FailOnNonCanceledErr(t, err, "store.Loop failed")
+	}()
 
 	return ret
 }

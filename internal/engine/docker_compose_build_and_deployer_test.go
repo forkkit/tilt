@@ -40,7 +40,9 @@ func TestDockerComposeTargetBuilt(t *testing.T) {
 		assert.Equal(t, "fe", call.ServiceName.String())
 		assert.True(t, call.ShouldBuild)
 	}
-	assert.Equal(t, expectedContainerID, res[dcTarg.ID()].DockerComposeContainerID.String())
+
+	dRes := res[dcTarg.ID()].(store.DockerComposeBuildResult)
+	assert.Equal(t, expectedContainerID, dRes.DockerComposeContainerID.String())
 }
 
 func TestTiltBuildsImage(t *testing.T) {
@@ -61,7 +63,7 @@ func TestTiltBuildsImage(t *testing.T) {
 
 	assert.Equal(t, 1, f.dCli.BuildCount, "expect one docker build")
 
-	expectedTag := fmt.Sprintf("%s:%s", iTarget.DeploymentRef, docker.TagLatest)
+	expectedTag := fmt.Sprintf("%s:%s", iTarget.Refs.LocalRef(), docker.TagLatest)
 	assert.Equal(t, expectedTag, f.dCli.TagTarget)
 
 	if assert.Len(t, f.dcCli.UpCalls, 1, "expect one call to `docker-compose up`") {
@@ -79,7 +81,7 @@ func TestTiltBuildsImageWithTag(t *testing.T) {
 	defer f.TearDown()
 
 	refWithTag := "gcr.io/foo:bar"
-	iTarget := model.NewImageTarget(container.MustParseSelector(refWithTag)).
+	iTarget := model.MustNewImageTarget(container.MustParseSelector(refWithTag)).
 		WithBuildDetails(model.DockerBuild{})
 	manifest := manifestbuilder.New(f, "fe").
 		WithDockerCompose().
@@ -124,7 +126,7 @@ func TestMultiStageDockerCompose(t *testing.T) {
 	expected := expectedFile{
 		Path: "Dockerfile",
 		Contents: `
-FROM docker.io/library/sancho-base:latest
+FROM sancho-base:latest
 ADD . .
 RUN go install github.com/windmilleng/sancho
 ENTRYPOINT /go/bin/sancho
@@ -141,7 +143,7 @@ func TestMultiStageDockerComposeWithOnlyOneDirtyImage(t *testing.T) {
 		WithDeployTarget(defaultDockerComposeTarget(f, "sancho"))
 
 	iTargetID := manifest.ImageTargets[0].ID()
-	result := store.NewImageBuildResult(iTargetID, container.MustParseNamedTagged("sancho-base:tilt-prebuilt"))
+	result := store.NewImageBuildResultSingleRef(iTargetID, container.MustParseNamedTagged("sancho-base:tilt-prebuilt"))
 	state := store.NewBuildState(result, nil)
 	stateSet := store.BuildStateSet{iTargetID: state}
 	f.dCli.ImageListCount = 1
@@ -156,7 +158,7 @@ func TestMultiStageDockerComposeWithOnlyOneDirtyImage(t *testing.T) {
 	expected := expectedFile{
 		Path: "Dockerfile",
 		Contents: `
-FROM docker.io/library/sancho-base:tilt-prebuilt
+FROM sancho-base:tilt-prebuilt
 ADD . .
 RUN go install github.com/windmilleng/sancho
 ENTRYPOINT /go/bin/sancho

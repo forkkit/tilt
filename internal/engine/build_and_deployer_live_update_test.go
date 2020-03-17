@@ -154,7 +154,7 @@ func runTestCase(t *testing.T, f *bdFixture, tCase testCase) {
 	if len(tCase.expectUpdatedTargets) > 0 {
 		expectUpdatedTargs = model.TargetIDSet(tCase.expectUpdatedTargets)
 	} else if len(tCase.runningContainersByTarget) > 0 {
-		for targID, _ := range tCase.runningContainersByTarget {
+		for targID := range tCase.runningContainersByTarget {
 			expectUpdatedTargs[targID] = true
 		}
 	} else {
@@ -163,7 +163,7 @@ func runTestCase(t *testing.T, f *bdFixture, tCase testCase) {
 	}
 
 	for tid, res := range result {
-		if !expectUpdatedTargs[tid] && !res.IsEmpty() {
+		if !expectUpdatedTargs[tid] && res != nil {
 			t.Fatalf("got non empty result for target %s when didn't expect one. Result: %v", tid, res)
 		}
 		// mark this target as seen
@@ -171,7 +171,8 @@ func runTestCase(t *testing.T, f *bdFixture, tCase testCase) {
 
 		if len(tCase.runningContainersByTarget) > 0 {
 			// We expect to have operated on the containers that the test specified
-			assert.ElementsMatch(t, res.LiveUpdatedContainerIDs, tCase.runningContainersByTarget[tid])
+			lRes := res.(store.LiveUpdateBuildResult)
+			assert.ElementsMatch(t, lRes.LiveUpdatedContainerIDs, tCase.runningContainersByTarget[tid])
 		} else {
 			// We set up the test with RunningContainer = DefaultContainer; expect to have operated on that.
 			assert.Equal(t, k8s.MagicTestContainerID, result.OneAndOnlyLiveUpdatedContainerID().String())
@@ -363,11 +364,11 @@ func TestLiveUpdateDiffImgMultipleContainersOnlySomeSyncsMatch(t *testing.T) {
 	sanchoLU := assembleLiveUpdate(sanchoSyncs, SanchoRunSteps, false, nil, f)
 	sidecarLU := assembleLiveUpdate(sidecarSyncs, RunStepsForApp("sidecar"),
 		false, nil, f)
-	sanchoTarg := model.NewImageTarget(SanchoRef).WithBuildDetails(model.DockerBuild{
+	sanchoTarg := model.MustNewImageTarget(SanchoRef).WithBuildDetails(model.DockerBuild{
 		Dockerfile: SanchoDockerfile,
 		BuildPath:  sanchoPath,
 	})
-	sidecarTarg := model.NewImageTarget(SanchoSidecarRef).WithBuildDetails(model.DockerBuild{
+	sidecarTarg := model.MustNewImageTarget(SanchoSidecarRef).WithBuildDetails(model.DockerBuild{
 		Dockerfile: SanchoDockerfile,
 		BuildPath:  sidecarPath,
 	})
@@ -404,11 +405,11 @@ func TestLiveUpdateDiffImgMultipleContainersSameContextOnlyOneLiveUpdate(t *test
 	sanchoSyncs[0].Source = buildContext
 
 	sanchoLU := assembleLiveUpdate(sanchoSyncs, SanchoRunSteps, false, nil, f)
-	sanchoTarg := model.NewImageTarget(SanchoRef).WithBuildDetails(model.DockerBuild{
+	sanchoTarg := model.MustNewImageTarget(SanchoRef).WithBuildDetails(model.DockerBuild{
 		Dockerfile: SanchoDockerfile,
 		BuildPath:  buildContext,
 	})
-	sidecarTarg := model.NewImageTarget(SanchoSidecarRef).WithBuildDetails(model.DockerBuild{
+	sidecarTarg := model.MustNewImageTarget(SanchoSidecarRef).WithBuildDetails(model.DockerBuild{
 		Dockerfile: SanchoDockerfile,
 		BuildPath:  buildContext,
 	})
@@ -468,8 +469,8 @@ func TestLiveUpdateDiffImgMultipleContainersFallBackIfFilesDoesntMatchAnySyncs(t
 		expectK8sExecCount: 0,
 
 		// fallback message for 1+ files not matching a sync
-		logsContain: []string{"found file(s) not matching a LiveUpdate sync",
-			f.JoinPath("doesnt_match.txt")},
+		logsContain: []string{"Found file(s) not matching any sync",
+			"doesnt_match.txt"},
 	}
 	runTestCase(t, f, tCase)
 }
@@ -953,7 +954,7 @@ func TestLiveUpdateLocalContainerFallBackOn(t *testing.T) {
 		expectDockerExecCount:    0,
 		expectDockerRestartCount: 0,
 		expectK8sDeploy:          true, // Because we fell back to image builder, we also did a k8s deploy
-		logsContain:              []string{"detected change to fall_back_on file", f.JoinPath("a.txt")},
+		logsContain:              []string{"Detected change to fall_back_on file", "a.txt"},
 	}
 	runTestCase(t, f, tCase)
 }
@@ -977,7 +978,7 @@ func TestLiveUpdateSyncletFallBackOn(t *testing.T) {
 		expectDockerRestartCount: 0,
 		expectK8sDeploy:          true, // because we fell back to image builder, we also did a k8s deploy
 		expectSyncletDeploy:      true, // (and expect that yaml to have contained the synclet)
-		logsContain:              []string{"detected change to fall_back_on file", f.JoinPath("a.txt")},
+		logsContain:              []string{"Detected change to fall_back_on file", "a.txt"},
 	}
 	runTestCase(t, f, tCase)
 }
@@ -1007,8 +1008,7 @@ func TestLiveUpdateLocalContainerChangedFileNotMatchingSyncFallsBack(t *testing.
 		expectDockerRestartCount: 0,
 		expectK8sDeploy:          true, // Because we fell back to image builder, we also did a k8s deploy
 
-		logsContain: []string{"found file(s) not matching a LiveUpdate sync",
-			f.JoinPath("a.txt")},
+		logsContain:     []string{"Found file(s) not matching any sync", "a.txt"},
 		logsDontContain: []string{"unexpected error"},
 	}
 	runTestCase(t, f, tCase)
@@ -1040,8 +1040,7 @@ func TestLiveUpdateSyncletChangedFileNotMatchingSyncFallsBack(t *testing.T) {
 		expectK8sDeploy:          true, // because we fell back to image builder, we also did a k8s deploy
 		expectSyncletDeploy:      true, // (and expect that yaml to have contained the synclet)
 
-		logsContain: []string{"found file(s) not matching a LiveUpdate sync",
-			f.JoinPath("a.txt")},
+		logsContain:     []string{"Found file(s) not matching any sync", "a.txt"},
 		logsDontContain: []string{"unexpected error"},
 	}
 	runTestCase(t, f, tCase)
@@ -1073,8 +1072,7 @@ func TestLiveUpdateSomeFilesMatchSyncSomeDontFallsBack(t *testing.T) {
 		expectDockerRestartCount: 0,
 		expectK8sDeploy:          true, // Because we fell back to image builder, we also did a k8s deploy
 
-		logsContain: []string{"found file(s) not matching a LiveUpdate sync",
-			f.JoinPath("a.txt")},
+		logsContain:     []string{"Found file(s) not matching any sync", "a.txt"},
 		logsDontContain: []string{"unexpected error"},
 	}
 	runTestCase(t, f, tCase)

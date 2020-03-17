@@ -12,10 +12,57 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/cache"
+
+	"github.com/windmilleng/tilt/pkg/logger"
 )
+
+var PodGVR = v1.SchemeGroupVersion.WithResource("pods")
+var ServiceGVR = v1.SchemeGroupVersion.WithResource("services")
+var EventGVR = v1.SchemeGroupVersion.WithResource("events")
+
+// A wrapper object around SharedInformer objects, to make them
+// a bit easier to use correctly.
+type ObjectUpdate struct {
+	obj      interface{}
+	isDelete bool
+}
+
+// Returns a Pod if this is a pod Add or a pod Update.
+func (r ObjectUpdate) AsPod() (*v1.Pod, bool) {
+	if r.isDelete {
+		return nil, false
+	}
+	pod, ok := r.obj.(*v1.Pod)
+	return pod, ok
+}
+
+// Returns (namespace, name, isDelete).
+//
+// The informer's OnDelete handler sometimes gives us a structured object, and
+// sometimes returns a DeletedFinalStateUnknown object. To make this easier to
+// handle correctly, we never allow access to the OnDelete object. Instead, we
+// force the caller to use AsDeletedKey() to get the identifier of the object.
+//
+// For more info, see:
+// https://godoc.org/k8s.io/client-go/tools/cache#ResourceEventHandler
+func (r ObjectUpdate) AsDeletedKey() (Namespace, string, bool) {
+	if !r.isDelete {
+		return "", "", false
+	}
+	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(r.obj)
+	if err != nil {
+		return "", "", false
+	}
+	ns, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return "", "", false
+	}
+	return Namespace(ns), name, true
+}
 
 type watcherFactory func(namespace string) watcher
 type watcher interface {
@@ -89,11 +136,12 @@ func (kCli K8sClient) makeInformer(
 	if err != nil {
 		return nil, errors.Wrap(err, "makeInformer")
 	}
+
 	return resFactory.Informer(), nil
 }
 
 func (kCli K8sClient) WatchEvents(ctx context.Context) (<-chan *v1.Event, error) {
-	gvr := v1.SchemeGroupVersion.WithResource("events")
+	gvr := EventGVR
 	informer, err := kCli.makeInformer(ctx, gvr, labels.Everything())
 	if err != nil {
 		return nil, errors.Wrap(err, "WatchEvents")
@@ -123,33 +171,33 @@ func (kCli K8sClient) WatchEvents(ctx context.Context) (<-chan *v1.Event, error)
 		},
 	})
 
-	go informer.Run(ctx.Done())
+	go runInformer(ctx, "events", informer)
 
 	return ch, nil
 }
 
-func (kCli K8sClient) WatchPods(ctx context.Context, ls labels.Selector) (<-chan *v1.Pod, error) {
-	gvr := v1.SchemeGroupVersion.WithResource("pods")
+func (kCli K8sClient) WatchPods(ctx context.Context, ls labels.Selector) (<-chan ObjectUpdate, error) {
+	gvr := PodGVR
 	informer, err := kCli.makeInformer(ctx, gvr, ls)
 	if err != nil {
 		return nil, errors.Wrap(err, "WatchPods")
 	}
 
-	ch := make(chan *v1.Pod)
+	ch := make(chan ObjectUpdate)
 	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			mObj, ok := obj.(*v1.Pod)
 			if ok {
 				FixContainerStatusImages(mObj)
-				ch <- mObj
 			}
+			ch <- ObjectUpdate{obj: obj}
 		},
 		DeleteFunc: func(obj interface{}) {
 			mObj, ok := obj.(*v1.Pod)
 			if ok {
 				FixContainerStatusImages(mObj)
-				ch <- mObj
 			}
+			ch <- ObjectUpdate{obj: obj, isDelete: true}
 		},
 		UpdateFunc: func(oldObj interface{}, newObj interface{}) {
 			oldPod, ok := oldObj.(*v1.Pod)
@@ -158,24 +206,22 @@ func (kCli K8sClient) WatchPods(ctx context.Context, ls labels.Selector) (<-chan
 			}
 
 			newPod, ok := newObj.(*v1.Pod)
-			if !ok {
+			if !ok || oldPod == newPod {
 				return
 			}
 
-			if oldPod != newPod {
-				FixContainerStatusImages(newPod)
-				ch <- newPod
-			}
+			FixContainerStatusImages(newPod)
+			ch <- ObjectUpdate{obj: newPod}
 		},
 	})
 
-	go informer.Run(ctx.Done())
+	go runInformer(ctx, "pods", informer)
 
 	return ch, nil
 }
 
 func (kCli K8sClient) WatchServices(ctx context.Context, ls labels.Selector) (<-chan *v1.Service, error) {
-	gvr := v1.SchemeGroupVersion.WithResource("services")
+	gvr := ServiceGVR
 	informer, err := kCli.makeInformer(ctx, gvr, ls)
 	if err != nil {
 		return nil, errors.Wrap(err, "WatchServices")
@@ -197,7 +243,37 @@ func (kCli K8sClient) WatchServices(ctx context.Context, ls labels.Selector) (<-
 		},
 	})
 
-	go informer.Run(ctx.Done())
+	go runInformer(ctx, "services", informer)
 
 	return ch, nil
+}
+
+func runInformer(ctx context.Context, name string, informer cache.SharedInformer) {
+	originalDuration := 3 * time.Second
+	originalBackoff := wait.Backoff{
+		Steps:    1000,
+		Duration: originalDuration,
+		Factor:   3.0,
+		Jitter:   0.5,
+		Cap:      time.Hour,
+	}
+	backoff := originalBackoff
+	_ = informer.SetDropWatchHandler(func(err error, doneCh <-chan struct{}) {
+		sleepTime := originalDuration
+		if err != nil {
+			sleepTime = backoff.Step()
+			logger.Get(ctx).Warnf("Pausing k8s %s watcher for %s: %v",
+				name,
+				sleepTime.Truncate(time.Second),
+				err)
+		} else {
+			backoff = originalBackoff
+		}
+
+		select {
+		case <-doneCh:
+		case <-time.After(sleepTime):
+		}
+	})
+	informer.Run(ctx.Done())
 }

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"github.com/windmilleng/tilt/internal/container"
 	"github.com/windmilleng/tilt/internal/store"
 	"github.com/windmilleng/tilt/pkg/model"
 )
@@ -18,22 +19,22 @@ type liveUpdateStateTree struct {
 func (t liveUpdateStateTree) createResultSet() store.BuildResultSet {
 	iTargetID := t.iTarget.ID()
 	state := t.iTargetState
-	res := state.LastResult
+	res := state.LastSuccessfulResult
 
-	res.LiveUpdatedContainerIDs = nil
+	liveUpdatedContainerIDs := []container.ID{}
 	for _, c := range state.RunningContainers {
-		res.LiveUpdatedContainerIDs = append(res.LiveUpdatedContainerIDs, c.ContainerID)
+		liveUpdatedContainerIDs = append(liveUpdatedContainerIDs, c.ContainerID)
 	}
 
 	resultSet := store.BuildResultSet{}
-	resultSet[iTargetID] = res
+	resultSet[iTargetID] = store.NewLiveUpdateBuildResult(res.TargetID(), liveUpdatedContainerIDs)
 
 	// Invalidate all the image builds for images we depend on.
 	// Otherwise, the image builder will think the existing image ID
 	// is valid and won't try to rebuild it.
 	for _, id := range t.hasFileChangesIDs {
 		if id != iTargetID {
-			resultSet[id] = store.BuildResult{}
+			resultSet[id] = nil
 		}
 	}
 

@@ -3,18 +3,30 @@ package engine
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/pkg/errors"
 	v1 "k8s.io/api/core/v1"
 
 	"github.com/windmilleng/tilt/internal/container"
 	"github.com/windmilleng/tilt/internal/engine/k8swatch"
+	"github.com/windmilleng/tilt/internal/engine/runtimelog"
 	"github.com/windmilleng/tilt/internal/k8s"
 	"github.com/windmilleng/tilt/internal/store"
 	"github.com/windmilleng/tilt/internal/synclet/sidecar"
 	"github.com/windmilleng/tilt/pkg/logger"
 	"github.com/windmilleng/tilt/pkg/model"
 )
+
+func handlePodDeleteAction(ctx context.Context, state *store.EngineState, action k8swatch.PodDeleteAction) {
+	// PodDeleteActions only have the pod id. We don't have a good way to tie them back to their ancestors.
+	// So just brute-force it.
+	for _, target := range state.ManifestTargets {
+		ms := target.State
+		runtime := ms.K8sRuntimeState()
+		delete(runtime.Pods, action.PodID)
+	}
+}
 
 func handlePodChangeAction(ctx context.Context, state *store.EngineState, action k8swatch.PodChangeAction) {
 	mt := matchPodChangeToManifest(state, action)
@@ -25,18 +37,22 @@ func handlePodChangeAction(ctx context.Context, state *store.EngineState, action
 	pod := action.Pod
 	ms := mt.State
 	manifest := mt.Manifest
-	podInfo, isNew := trackPod(ms, action)
-	podID := k8s.PodIDFromPod(pod)
-	if podInfo.PodID != podID {
-		// This is an event from an old pod.
+	podInfo, isNew := maybeTrackPod(ms, action)
+	if podInfo == nil {
+		// This is an event from an old pod that has never been tracked.
 		return
 	}
 
 	// Update the status
+	podInfo.StartedAt = pod.CreationTimestamp.Time
+	podInfo.Status = k8swatch.PodStatusToString(*pod)
+	podInfo.Namespace = k8s.NamespaceFromPod(pod)
+	podInfo.HasSynclet = sidecar.PodSpecContainsSynclet(pod.Spec)
+	podInfo.SpanID = runtimelog.SpanIDForPod(podInfo.PodID)
 	podInfo.Deleting = pod.DeletionTimestamp != nil && !pod.DeletionTimestamp.IsZero()
 	podInfo.Phase = pod.Status.Phase
-	podInfo.Status = k8swatch.PodStatusToString(*pod)
 	podInfo.StatusMessages = k8swatch.PodStatusErrorMessages(*pod)
+	podInfo.Conditions = pod.Status.Conditions
 
 	prunePods(ms)
 
@@ -57,17 +73,27 @@ func handlePodChangeAction(ctx context.Context, state *store.EngineState, action
 		return
 	}
 
+	if podInfo.AllContainersReady() || podInfo.Phase == v1.PodSucceeded {
+		runtime := ms.K8sRuntimeState()
+		runtime.LastReadyOrSucceededTime = time.Now()
+		ms.RuntimeState = runtime
+	}
+
 	fwdsValid := portForwardsAreValid(manifest, *podInfo)
 	if !fwdsValid {
-		logger.Get(ctx).Infof(
-			"WARNING: Resource %s is using port forwards, but no container ports on pod %s",
+		logger.Get(ctx).Warnf(
+			"Resource %s is using port forwards, but no container ports on pod %s",
 			manifest.Name, podInfo.PodID)
 	}
 	checkForContainerCrash(ctx, state, mt)
 
 	if oldRestartTotal < podInfo.AllContainerRestarts() {
-		ms.CrashLog = podInfo.CurrentLog
-		podInfo.CurrentLog = model.Log{}
+		spanID := podInfo.SpanID
+		if spanID == "" {
+			ms.CrashLog = model.Log{}
+		} else {
+			ms.CrashLog = model.NewLog(state.LogStore.TailSpan(50, spanID))
+		}
 	}
 }
 
@@ -75,7 +101,7 @@ func handlePodChangeAction(ctx context.Context, state *store.EngineState, action
 // and confirm that it matches what we've deployed.
 func matchPodChangeToManifest(state *store.EngineState, action k8swatch.PodChangeAction) *store.ManifestTarget {
 	manifestName := action.ManifestName
-	ancestorUID := action.AncestorUID
+	matchedAncestorUID := action.MatchedAncestorUID
 	mt, ok := state.ManifestTargets[manifestName]
 	if !ok {
 		// This is OK. The user could have edited the manifest recently.
@@ -87,43 +113,42 @@ func matchPodChangeToManifest(state *store.EngineState, action k8swatch.PodChang
 
 	// If the event has an ancestor UID attached, but that ancestor isn't in the
 	// deployed UID set anymore, we can ignore it.
-	isAncestorMatch := ancestorUID != ""
-	if isAncestorMatch && !runtime.DeployedUIDSet.Contains(ancestorUID) {
+	isAncestorMatched := matchedAncestorUID != ""
+	if isAncestorMatched && !runtime.DeployedUIDSet.Contains(matchedAncestorUID) {
 		return nil
 	}
 	return mt
 }
 
 // Checks the runtime state if we're already tracking this pod.
-// If not, create a new tracking object.
+// If not, AND if the pod matches the current deploy, create a new tracking object.
 // Returns a store.Pod that the caller can mutate, and true
 // if this is the first time we've seen this pod.
-func trackPod(ms *store.ManifestState, action k8swatch.PodChangeAction) (*store.Pod, bool) {
+func maybeTrackPod(ms *store.ManifestState, action k8swatch.PodChangeAction) (*store.Pod, bool) {
 	pod := action.Pod
 	podID := k8s.PodIDFromPod(pod)
-	startedAt := pod.CreationTimestamp.Time
-	status := k8swatch.PodStatusToString(*pod)
-	ns := k8s.NamespaceFromPod(pod)
-	hasSynclet := sidecar.PodSpecContainsSynclet(pod.Spec)
 	runtime := ms.GetOrCreateK8sRuntimeState()
+	isCurrentDeploy := runtime.HasOKPodTemplateSpecHash(pod) // is pod from the most recent Tilt deploy?
+
+	// Only attach a new pod to the runtime state if it's from the current deploy;
+	// if it's from an old deploy/an old Tilt run, we don't want to be checking it
+	// for status etc.
+	if !isCurrentDeploy {
+		return runtime.Pods[podID], false
+	}
 
 	// Case 1: We haven't seen pods for this ancestor yet.
-	ancestorUID := action.AncestorUID
-	isAncestorMatch := ancestorUID != ""
+	matchedAncestorUID := action.MatchedAncestorUID
+	isAncestorMatch := matchedAncestorUID != ""
 	if runtime.PodAncestorUID == "" ||
-		(isAncestorMatch && runtime.PodAncestorUID != ancestorUID) {
-		runtime.PodAncestorUID = ancestorUID
+		(isAncestorMatch && runtime.PodAncestorUID != matchedAncestorUID) {
+
+		// Track a new ancestor ID, and delete all existing tracked pods.
 		runtime.Pods = make(map[k8s.PodID]*store.Pod)
-		pod := &store.Pod{
-			PodID:      podID,
-			StartedAt:  startedAt,
-			Status:     status,
-			Namespace:  ns,
-			HasSynclet: hasSynclet,
-		}
-		runtime.Pods[podID] = pod
+		runtime.PodAncestorUID = matchedAncestorUID
 		ms.RuntimeState = runtime
-		return pod, true
+
+		// Fall through to the case below to create a new tracked pod.
 	}
 
 	podInfo, ok := runtime.Pods[podID]
@@ -131,13 +156,11 @@ func trackPod(ms *store.ManifestState, action k8swatch.PodChangeAction) (*store.
 		// CASE 2: We have a set of pods for this ancestor UID, but not this
 		// particular pod -- record it
 		podInfo = &store.Pod{
-			PodID:      podID,
-			StartedAt:  startedAt,
-			Status:     status,
-			Namespace:  ns,
-			HasSynclet: hasSynclet,
+			PodID: podID,
 		}
+
 		runtime.Pods[podID] = podInfo
+
 		return podInfo, true
 	}
 
@@ -188,11 +211,17 @@ func containerForStatus(ctx context.Context, pod *v1.Pod, cStatus v1.ContainerSt
 		ports = append(ports, cPort.ContainerPort)
 	}
 
+	isRunning := false
+	if cStatus.State.Running != nil && !cStatus.State.Running.StartedAt.IsZero() {
+		isRunning = true
+	}
+
 	return store.Container{
 		Name:     cName,
 		ID:       cID,
 		Ports:    ports,
 		Ready:    cStatus.Ready,
+		Running:  isRunning,
 		ImageRef: cRef,
 		Restarts: int(cStatus.RestartCount),
 	}, nil
@@ -222,15 +251,17 @@ func checkForContainerCrash(ctx context.Context, state *store.EngineState, mt *s
 	// The pod isn't what we expect!
 	// TODO(nick): We should store the logs by container ID, and
 	// only put the container that crashed in the CrashLog.
-	ms.CrashLog = ms.MostRecentPod().CurrentLog
+	spanID := ms.MostRecentPod().SpanID
+	if spanID == "" {
+		ms.CrashLog = model.Log{}
+	} else {
+		ms.CrashLog = model.NewLog(state.LogStore.TailSpan(50, spanID))
+	}
+
 	ms.NeedsRebuildFromCrash = true
 	ms.LiveUpdatedContainerIDs = container.NewIDSet()
 	msg := fmt.Sprintf("Detected a container change for %s. We could be running stale code. Rebuilding and deploying a new image.", ms.Name)
-	le := store.NewLogEvent(ms.Name, []byte(msg+"\n"))
-	if len(ms.BuildHistory) > 0 {
-		ms.BuildHistory[0].Log = model.AppendLog(ms.BuildHistory[0].Log, le, state.LogTimestamps, "", state.Secrets)
-	}
-	ms.CurrentBuild.Log = model.AppendLog(ms.CurrentBuild.Log, le, state.LogTimestamps, "", state.Secrets)
+	le := store.NewLogAction(ms.Name, ms.LastBuild().SpanID, logger.WarnLvl, nil, []byte(msg+"\n"))
 	handleLogAction(state, le)
 }
 
@@ -258,37 +289,12 @@ func prunePods(ms *store.ManifestState) {
 		}
 
 		// found nothing to delete, break out
+		// NOTE(dmiller): above comment is probably erroneous, but disabling this check because I'm not sure if this is safe to change
+		// original static analysis error:
+		// SA4004: the surrounding loop is unconditionally terminated (staticcheck)
+		//nolint:staticcheck
 		return
 	}
-}
-
-func handlePodLogAction(state *store.EngineState, action PodLogAction) {
-	manifestName := action.Source()
-	ms, ok := state.ManifestState(manifestName)
-	if !ok {
-		// This is OK. The user could have edited the manifest recently.
-		return
-	}
-
-	podID := action.PodID
-	runtime := ms.GetOrCreateK8sRuntimeState()
-	if !runtime.ContainsID(podID) {
-		// NOTE(nick): There are two cases where this could happen:
-		// 1) Pod 1 died and kubernetes started Pod 2. What should we do with
-		//    logs from Pod 1 that are still in the action queue?
-		//    This is an open product question. A future HUD may aggregate
-		//    logs across pod restarts.
-		// 2) Due to race conditions, we got the logs for Pod 1 before
-		//    we saw Pod 1 materialize on the Pod API. The best way to fix
-		//    this would be to make PodLogManager a subscriber that only
-		//    starts listening on logs once the pod has materialized.
-		//    We may prioritize this higher or lower based on how often
-		//    this happens in practice.
-		return
-	}
-
-	podInfo := runtime.Pods[podID]
-	podInfo.CurrentLog = model.AppendLog(podInfo.CurrentLog, action, state.LogTimestamps, "", state.Secrets)
 }
 
 func handlePodResetRestartsAction(state *store.EngineState, action store.PodResetRestartsAction) {

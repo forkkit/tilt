@@ -5,13 +5,14 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/davecgh/go-spew/spew"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/windmilleng/wmclient/pkg/analytics"
@@ -31,8 +32,10 @@ import (
 	"github.com/windmilleng/tilt/internal/sliceutils"
 	"github.com/windmilleng/tilt/internal/testutils"
 	"github.com/windmilleng/tilt/internal/testutils/tempdir"
+	"github.com/windmilleng/tilt/internal/tiltfile/k8scontext"
 	"github.com/windmilleng/tilt/internal/tiltfile/testdata"
 	"github.com/windmilleng/tilt/internal/yaml"
+	"github.com/windmilleng/tilt/pkg/logger"
 	"github.com/windmilleng/tilt/pkg/model"
 )
 
@@ -64,17 +67,6 @@ k8s_resource('foo', 'foo.yaml')
 `)
 
 	f.loadErrString("foo/Dockerfile", "no such file or directory", "error reading dockerfile")
-}
-
-func TestGitRepoBadMethodCall(t *testing.T) {
-	f := newFixture(t)
-	defer f.TearDown()
-	f.setupFoo()
-	f.file("Tiltfile", `
-local_git_repo('.').asdf()
-`)
-
-	f.loadErrString("Tiltfile:2:20: in <toplevel>", "Error: gitRepo has no .asdf field or method")
 }
 
 func TestCustomBuildBadMethodCall(t *testing.T) {
@@ -132,11 +124,9 @@ k8s_yaml('foo.yaml')
 
 	iTarget := m.ImageTargetAt(0)
 
-	// Make sure there's no fast build / live update in the default case.
+	// Make sure there's no live update in the default case.
 	assert.True(t, iTarget.IsDockerBuild())
-	assert.False(t, iTarget.IsFastBuild())
-	assert.True(t, iTarget.AnyFastBuildInfo().Empty())
-	assert.True(t, iTarget.AnyLiveUpdateInfo().Empty())
+	assert.True(t, iTarget.LiveUpdateInfo().Empty())
 }
 
 // I.e. make sure that we handle de/normalization between `fooimage` <--> `docker.io/library/fooimage`
@@ -156,7 +146,7 @@ k8s_yaml('foo.yaml')
 	f.load()
 
 	f.assertNextManifest("foo",
-		db(imageNormalized("fooimage")),
+		db(image("fooimage")),
 		deployment("foo"))
 	f.assertConfigFiles("Tiltfile", ".tiltignore", "foo/Dockerfile", "foo/.dockerignore", "foo.yaml")
 }
@@ -284,6 +274,33 @@ k8s_yaml(yaml)
 	assert.Contains(t, f.out.String(), " → kind: Deployment")
 }
 
+func TestLocalQuiet(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.setupFoo()
+
+	f.file("Tiltfile", `
+local('echo foobar', quiet=True)
+`)
+
+	f.load()
+
+	assert.Contains(t, f.out.String(), "local: echo foobar")
+	assert.NotContains(t, f.out.String(), " → foobar")
+}
+
+func TestLocalArgvCmd(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	// this would generate a syntax error if evaluated by a shell
+	f.file("Tiltfile", `local(['echo', 'a"b'])`)
+	f.load()
+
+	assert.Contains(t, f.out.String(), `a"b`)
+}
+
 func TestReadFile(t *testing.T) {
 	f := newFixture(t)
 	defer f.TearDown()
@@ -324,6 +341,14 @@ k8s_resource("the-deployment", "foo")
 	f.assertConfigFiles("Tiltfile", ".tiltignore", "foo/Dockerfile", "foo/.dockerignore", "configMap.yaml", "deployment.yaml", "kustomization.yaml", "service.yaml")
 }
 
+func TestKustomizeError(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.file("Tiltfile", "kustomize('.')")
+	f.loadErrString("unable to find one of 'kustomization.yaml', 'kustomization.yml' or 'Kustomization'")
+}
+
 func TestKustomization(t *testing.T) {
 	f := newFixture(t)
 	defer f.TearDown()
@@ -358,6 +383,90 @@ docker_build("gcr.io/foo", "foo", target='stage')
 	assert.Equal(t, "stage", m.ImageTargets[0].BuildDetails.(model.DockerBuild).TargetStage.String())
 }
 
+func TestDockerBuildSSH(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.setupFoo()
+	f.file("Tiltfile", `
+k8s_yaml('foo.yaml')
+docker_build("gcr.io/foo", "foo", ssh='default')
+`)
+	f.load()
+	m := f.assertNextManifest("foo")
+	assert.Equal(t, []string{"default"}, m.ImageTargets[0].BuildDetails.(model.DockerBuild).SSHSpecs)
+}
+
+func TestDockerBuildSecret(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.setupFoo()
+	f.file("Tiltfile", `
+k8s_yaml('foo.yaml')
+docker_build("gcr.io/foo", "foo", secret='id=shibboleth')
+`)
+	f.load()
+	m := f.assertNextManifest("foo")
+	assert.Equal(t, []string{"id=shibboleth"}, m.ImageTargets[0].BuildDetails.(model.DockerBuild).SecretSpecs)
+}
+
+func TestDockerBuildNetwork(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.setupFoo()
+	f.file("Tiltfile", `
+k8s_yaml('foo.yaml')
+docker_build("gcr.io/foo", "foo", network='default')
+`)
+	f.load()
+	m := f.assertNextManifest("foo")
+	assert.Equal(t, "default", m.ImageTargets[0].BuildDetails.(model.DockerBuild).Network)
+}
+
+func TestDockerBuildExtraTagString(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.setupFoo()
+	f.file("Tiltfile", `
+k8s_yaml('foo.yaml')
+docker_build("gcr.io/foo", "foo", extra_tag='foo:latest')
+`)
+	f.load()
+	m := f.assertNextManifest("foo")
+	assert.Equal(t, []string{"foo:latest"},
+		m.ImageTargets[0].BuildDetails.(model.DockerBuild).ExtraTags)
+}
+
+func TestDockerBuildExtraTagList(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.setupFoo()
+	f.file("Tiltfile", `
+k8s_yaml('foo.yaml')
+docker_build("gcr.io/foo", "foo", extra_tag=['foo:latest', 'foo:jenkins-1234'])
+`)
+	f.load()
+	m := f.assertNextManifest("foo")
+	assert.Equal(t, []string{"foo:latest", "foo:jenkins-1234"},
+		m.ImageTargets[0].BuildDetails.(model.DockerBuild).ExtraTags)
+}
+
+func TestDockerBuildExtraTagListInvalid(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.setupFoo()
+	f.file("Tiltfile", `
+k8s_yaml('foo.yaml')
+docker_build("gcr.io/foo", "foo", extra_tag='cherry bomb')
+`)
+	f.loadErrString("Argument extra_tag=\"cherry bomb\" not a valid image reference: invalid reference format")
+}
+
 func TestDockerBuildCache(t *testing.T) {
 	f := newFixture(t)
 	defer f.TearDown()
@@ -367,8 +476,7 @@ func TestDockerBuildCache(t *testing.T) {
 k8s_yaml('foo.yaml')
 docker_build("gcr.io/foo", "foo", cache='/paths/to/cache')
 `)
-	f.load()
-	f.assertNextManifest("foo", dbWithCache(image("gcr.io/foo"), "/paths/to/cache"))
+	f.loadAssertWarnings(cacheObsoleteWarning)
 }
 
 func TestDuplicateResourceNames(t *testing.T) {
@@ -438,27 +546,44 @@ type portForwardCase struct {
 	expr     string
 	expected []model.PortForward
 	errorMsg string
+	webHost  model.WebHost
+}
+
+func newPortForwardSuccessCase(name, expr string, expected []model.PortForward) portForwardCase {
+	return portForwardCase{name: name, expr: expr, expected: expected}
+}
+
+func newPortForwardErrorCase(name, expr, errorMsg string) portForwardCase {
+	return portForwardCase{name: name, expr: expr, errorMsg: errorMsg}
 }
 
 func TestPortForward(t *testing.T) {
 	portForwardCases := []portForwardCase{
-		{"value_local", "8000", []model.PortForward{{LocalPort: 8000}}, ""},
-		{"value_local_negative", "-1", nil, "not in the range for a port"},
-		{"value_local_large", "8000000", nil, "not in the range for a port"},
-		{"value_string_local", "'10000'", []model.PortForward{{LocalPort: 10000}}, ""},
-		{"value_string_both", "'10000:8000'", []model.PortForward{{LocalPort: 10000, ContainerPort: 8000}}, ""},
-		{"value_string_garbage", "'garbage'", nil, "not in the range for a port"},
-		{"value_string_3x80", "'80:80:80'", nil, "not in the range for a port"},
-		{"value_string_empty", "''", nil, "not in the range for a port"},
-		{"value_both", "port_forward(8001, 443)", []model.PortForward{{LocalPort: 8001, ContainerPort: 443}}, ""},
-		{"list", "[8000, port_forward(8001, 443)]", []model.PortForward{{LocalPort: 8000}, {LocalPort: 8001, ContainerPort: 443}}, ""},
-		{"list_string", "['8000', '8001:443']", []model.PortForward{{LocalPort: 8000}, {LocalPort: 8001, ContainerPort: 443}}, ""},
+		newPortForwardSuccessCase("value_local", "8000", []model.PortForward{{LocalPort: 8000}}),
+		newPortForwardErrorCase("value_local_negative", "-1", "not in the valid range"),
+		newPortForwardErrorCase("value_local_large", "8000000", "not in the valid range"),
+		newPortForwardSuccessCase("value_string_local", "'10000'", []model.PortForward{{LocalPort: 10000}}),
+		newPortForwardSuccessCase("value_string_both", "'10000:8000'", []model.PortForward{{LocalPort: 10000, ContainerPort: 8000}}),
+		newPortForwardErrorCase("value_string_garbage", "'garbage'", "not in the valid range"),
+		newPortForwardErrorCase("value_string_empty", "''", "not in the valid range"),
+		newPortForwardSuccessCase("value_both", "port_forward(8001, 443)", []model.PortForward{{LocalPort: 8001, ContainerPort: 443}}),
+		newPortForwardSuccessCase("list", "[8000, port_forward(8001, 443)]", []model.PortForward{{LocalPort: 8000}, {LocalPort: 8001, ContainerPort: 443}}),
+		newPortForwardSuccessCase("list_string", "['8000', '8001:443']", []model.PortForward{{LocalPort: 8000}, {LocalPort: 8001, ContainerPort: 443}}),
+		newPortForwardErrorCase("value_host_bad", "'bad+host:10000:8000'", "not a valid hostname or IP address"),
+		newPortForwardSuccessCase("value_host_good_ip", "'0.0.0.0:10000:8000'", []model.PortForward{{LocalPort: 10000, ContainerPort: 8000, Host: "0.0.0.0"}}),
+		newPortForwardSuccessCase("value_host_good_domain", "'tilt.dev:10000:8000'", []model.PortForward{{LocalPort: 10000, ContainerPort: 8000, Host: "tilt.dev"}}),
+		portForwardCase{name: "default_web_host", expr: "8000", webHost: "0.0.0.0",
+			expected: []model.PortForward{{LocalPort: 8000, Host: "0.0.0.0"}}},
+		portForwardCase{name: "override_web_host", expr: "'tilt.dev:10000:8000'", webHost: "0.0.0.0",
+			expected: []model.PortForward{{LocalPort: 10000, ContainerPort: 8000, Host: "tilt.dev"}}},
 	}
 
 	for _, c := range portForwardCases {
 		t.Run(c.name, func(t *testing.T) {
 			f := newFixture(t)
 			defer f.TearDown()
+
+			f.webHost = c.webHost
 			f.setupFoo()
 			s := `
 docker_build('gcr.io/foo', 'foo')
@@ -760,7 +885,7 @@ docker_build('gcr.io/bar', 'bar')
 k8s_yaml('bar.yaml')
 `)
 
-	tlr := f.newTiltfileLoader().Load(f.ctx, f.JoinPath("Tiltfile"), matchMap("baz"))
+	tlr := f.newTiltfileLoader().Load(f.ctx, f.JoinPath("Tiltfile"), model.NewUserConfigState([]string{"baz"}))
 	err := tlr.Error
 	if assert.Error(t, err) {
 		assert.Equal(t, `You specified some resources that could not be found: "baz"
@@ -788,6 +913,24 @@ k8s_yaml('foo.yaml')
 		fileChangeMatches("Tiltfile"),
 		buildMatches("foo.yaml"),
 		fileChangeMatches("foo.yaml"),
+	)
+}
+
+func TestCustomBuildGitPathFilter(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.gitInit("")
+	f.file("Dockerfile", "FROM golang:1.10")
+	f.yaml("foo.yaml", deployment("foo", image("gcr.io/foo")))
+	f.file("Tiltfile", `
+custom_build('gcr.io/foo', 'docker build -t gcr.io/foo .', ['.'])
+k8s_yaml('foo.yaml')
+`)
+
+	f.load("foo")
+	f.assertNextManifest("foo",
+		fileChangeFilters(".git"),
 	)
 }
 
@@ -1050,14 +1193,75 @@ k8s_yaml(yml)
 
 	f.load()
 
-	m := f.assertNextManifestUnresourced("rose-quartz-helloworld-chart")
+	m := f.assertNextManifestUnresourced("garnet", "rose-quartz-helloworld-chart")
 	yaml := m.K8sTarget().YAML
 	assert.Contains(t, yaml, "release: rose-quartz")
 	assert.Contains(t, yaml, "namespace: garnet")
 	assert.Contains(t, yaml, "namespaceLabel: garnet")
 	assert.Contains(t, yaml, "name: nginx-dev")
 
+	entities, err := k8s.ParseYAMLFromString(yaml)
+	require.NoError(t, err)
+
+	names := k8s.UniqueNames(entities, 2)
+	expectedNames := []string{"garnet:namespace", "rose-quartz-helloworld-chart:service"}
+	assert.ElementsMatch(t, expectedNames, names)
+
 	f.assertConfigFiles("./helm/", "./dev/helm/values-dev.yaml", ".tiltignore", "Tiltfile")
+}
+
+func TestHelmNamespaceFlagDoesNotInsertNSEntityIfNSInChart(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.setupHelm()
+
+	valuesWithNamespace := `
+namespace:
+  enabled: true
+  name: foobarbaz`
+	f.file("helm/extra_values.yaml", valuesWithNamespace)
+
+	f.file("Tiltfile", `
+yml = helm('./helm', name='rose-quartz', namespace="foobarbaz", values=['./helm/extra_values.yaml'])
+k8s_yaml(yml)
+`)
+
+	f.load()
+
+	m := f.assertNextManifestUnresourced("foobarbaz", "rose-quartz-helloworld-chart")
+	yaml := m.K8sTarget().YAML
+
+	entities, err := k8s.ParseYAMLFromString(yaml)
+	require.NoError(t, err)
+	require.Len(t, entities, 2)
+	e := entities[0]
+	require.Equal(t, "Namespace", e.GVK().Kind)
+	assert.Equal(t, "foobarbaz", e.Name())
+	assert.Equal(t, "indeed", e.Labels()["somePersistedLabel"],
+		"label originally specified in chart YAML should persist")
+}
+
+func TestHelmNamespaceFlagInsertsNSEntityIfDifferentNSInChart(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.setupHelm()
+
+	valuesWithNamespace := `
+namespace:
+  enabled: true
+  name: not-the-one-specified-in-flag` // what kind of jerk would do this?
+	f.file("helm/extra_values.yaml", valuesWithNamespace)
+
+	f.file("Tiltfile", `
+yml = helm('./helm', name='rose-quartz', namespace="foobarbaz", values=['./helm/extra_values.yaml'])
+k8s_yaml(yml)
+`)
+
+	f.load()
+
+	f.assertNextManifestUnresourced("foobarbaz", "not-the-one-specified-in-flag", "rose-quartz-helloworld-chart")
 }
 
 func TestHelmInvalidDirectory(t *testing.T) {
@@ -1107,7 +1311,6 @@ k8s_yaml('foo.yaml')
 	f.load()
 	m := f.assertNextManifest("foo", db(image("gcr.io/foo")))
 	assert.True(t, m.ImageTargetAt(0).IsDockerBuild())
-	assert.False(t, m.ImageTargetAt(0).IsFastBuild())
 }
 
 func TestSanchoSidecar(t *testing.T) {
@@ -1127,9 +1330,9 @@ docker_build('gcr.io/some-project-162817/sancho-sidecar', '.')
 	m := f.assertNextManifest("sancho")
 	assert.Equal(t, 2, len(m.ImageTargets))
 	assert.Equal(t, "gcr.io/some-project-162817/sancho",
-		m.ImageTargetAt(0).ConfigurationRef.String())
+		m.ImageTargetAt(0).Refs.ConfigurationRef.String())
 	assert.Equal(t, "gcr.io/some-project-162817/sancho-sidecar",
-		m.ImageTargetAt(1).ConfigurationRef.String())
+		m.ImageTargetAt(1).Refs.ConfigurationRef.String())
 }
 
 func TestSanchoRedisSidecar(t *testing.T) {
@@ -1148,7 +1351,7 @@ docker_build('gcr.io/some-project-162817/sancho', '.')
 	m := f.assertNextManifest("sancho")
 	assert.Equal(t, 1, len(m.ImageTargets))
 	assert.Equal(t, "gcr.io/some-project-162817/sancho",
-		m.ImageTargetAt(0).ConfigurationRef.String())
+		m.ImageTargetAt(0).Refs.ConfigurationRef.String())
 }
 
 func TestExtraPodSelectors(t *testing.T) {
@@ -1234,7 +1437,7 @@ docker_build('gcr.io/foo:stable', '.')
 k8s_yaml('foo.yaml')
 `)
 
-	w := unusedImageWarning("gcr.io/foo:stable", []string{"gcr.io/foo", "docker.io/library/golang"})
+	w := unusedImageWarning("gcr.io/foo:stable", []string{"gcr.io/foo"})
 	f.loadAssertWarnings(w)
 }
 
@@ -1250,7 +1453,7 @@ docker_build('gcr.io/foo:stable', '.')
 k8s_yaml('foo.yaml')
 `)
 
-	w := unusedImageWarning("gcr.io/foo:stable", []string{"gcr.io/foo", "docker.io/library/golang"})
+	w := unusedImageWarning("gcr.io/foo:stable", []string{"gcr.io/foo"})
 	f.loadAssertWarnings(w)
 }
 
@@ -1354,8 +1557,8 @@ k8s_yaml('foo.yaml')
 	m := f.assertNextManifest("foo",
 		deployment("foo", image("gcr.io/image-a"), image("gcr.io/image-b")))
 
-	assert.True(t, m.ImageTargetAt(0).AnyLiveUpdateInfo().Empty())
-	assert.False(t, m.ImageTargetAt(1).AnyLiveUpdateInfo().Empty())
+	assert.True(t, m.ImageTargetAt(0).LiveUpdateInfo().Empty())
+	assert.False(t, m.ImageTargetAt(1).LiveUpdateInfo().Empty())
 }
 
 func TestImageDependencyCycle(t *testing.T) {
@@ -1484,8 +1687,8 @@ k8s_yaml('auth.yaml')
 
 	m := f.assertNextManifest("auth", deployment("auth"))
 	assert.Equal(t, []string{
-		"docker.io/vandelay/common",
-		"docker.io/vandelay/auth",
+		"vandelay/common",
+		"vandelay/auth",
 	}, f.imageTargetNames(m))
 }
 
@@ -1510,8 +1713,8 @@ k8s_yaml('app.yaml')
 
 	m := f.assertNextManifest("app", deployment("app"), deployment("app-jessie"))
 	assert.Equal(t, []string{
-		"docker.io/vandelay/app",
-		"docker.io/vandelay/app:jessie",
+		"vandelay/app",
+		"vandelay/app:jessie",
 	}, f.imageTargetNames(m))
 }
 
@@ -1534,8 +1737,8 @@ k8s_yaml('app.yaml')
 
 	f.load()
 
-	f.assertNextManifest("app", deployment("app", image("docker.io/vandelay/app")))
-	f.assertNextManifest("app-jessie", deployment("app-jessie", image("docker.io/vandelay/app:jessie")))
+	f.assertNextManifest("app", deployment("app", image("vandelay/app")))
+	f.assertNextManifest("app-jessie", deployment("app-jessie", image("vandelay/app:jessie")))
 }
 
 func TestImagesWithSameNameDifferentManifests(t *testing.T) {
@@ -1560,12 +1763,12 @@ k8s_resource('jessie', image='vandelay/app:jessie')
 
 	m := f.assertNextManifest("jessie", deployment("app-jessie"))
 	assert.Equal(t, []string{
-		"docker.io/vandelay/app:jessie",
+		"vandelay/app:jessie",
 	}, f.imageTargetNames(m))
 
 	m = f.assertNextManifest("app", deployment("app"))
 	assert.Equal(t, []string{
-		"docker.io/vandelay/app",
+		"vandelay/app",
 	}, f.imageTargetNames(m))
 }
 
@@ -1579,7 +1782,7 @@ docker_build('gcr.typo.io/foo', 'foo')
 k8s_yaml('foo.yaml')
 `)
 
-	w := unusedImageWarning("gcr.typo.io/foo", []string{"gcr.io/foo", "docker.io/library/golang"})
+	w := unusedImageWarning("gcr.typo.io/foo", []string{"gcr.io/foo"})
 	f.loadAssertWarnings(w)
 }
 
@@ -1741,7 +1944,18 @@ func TestYamlErrorFromHelm(t *testing.T) {
 	f.file("Tiltfile", `
 k8s_yaml(helm('helm'))
 `)
-	f.loadErrString("from helm")
+
+	// TODO(dmiller): there should be a better assertion here
+
+	version, err := getHelmVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version == helmV2 {
+		f.loadErrString("from helm")
+	} else {
+		f.loadErrString("in helm")
+	}
 }
 
 func TestYamlErrorFromBlob(t *testing.T) {
@@ -1771,7 +1985,7 @@ custom_build(
 	f.load("foo")
 	f.assertNumManifests(1)
 	f.assertConfigFiles("Tiltfile", ".tiltignore", "foo.yaml", "foo/.dockerignore")
-	f.assertNextManifest("foo",
+	m := f.assertNextManifest("foo",
 		cb(
 			image("gcr.io/foo"),
 			deps(f.JoinPath("foo")),
@@ -1779,6 +1993,7 @@ custom_build(
 			tag("my-great-tag"),
 		),
 		deployment("foo"))
+	assert.False(t, m.ImageTargets[0].CustomBuildInfo().SkipsPush())
 }
 
 func TestCustomBuildDisablePush(t *testing.T) {
@@ -1809,6 +2024,32 @@ hfb = custom_build(
 		deployment("foo"))
 }
 
+func TestCustomBuildSkipsLocalDocker(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	tiltfile := `
+k8s_yaml('foo.yaml')
+custom_build(
+  'gcr.io/foo',
+  'buildah bud -t $TAG foo && buildah push $TAG $TAG',
+	['foo'],
+	skips_local_docker=True,
+)`
+
+	f.setupFoo()
+	f.file("Tiltfile", tiltfile)
+
+	f.load("foo")
+	m := f.assertNextManifest("foo",
+		cb(
+			image("gcr.io/foo"),
+		),
+		deployment("foo"))
+	assert.True(t, m.ImageTargets[0].CustomBuildInfo().SkipsLocalDocker)
+	assert.True(t, m.ImageTargets[0].CustomBuildInfo().SkipsPush())
+}
+
 func TestExtraImageLocationOneImage(t *testing.T) {
 	f := newFixture(t)
 	defer f.TearDown()
@@ -1825,7 +2066,7 @@ docker_build('test/mycrd-env', 'env')
 	f.load("mycrd")
 	f.assertNextManifest("mycrd",
 		db(
-			image("docker.io/test/mycrd-env"),
+			image("test/mycrd-env"),
 		),
 		k8sObject("mycrd", "Environment"),
 	)
@@ -1859,7 +2100,7 @@ type k8sKindTest struct {
 	expectImage          bool
 	expectedError        string
 	preamble             string
-	expectedResourceName string
+	expectedResourceName model.ManifestName
 }
 
 func TestK8sKind(t *testing.T) {
@@ -1896,14 +2137,14 @@ k8s_kind(%s)
 				if test.expectedError != "" {
 					t.Fatal("invalid test: cannot expect both workload and error")
 				}
-				expectedResourceName := "mycrd"
+				expectedResourceName := model.ManifestName("mycrd")
 				if test.expectedResourceName != "" {
 					expectedResourceName = test.expectedResourceName
 				}
-				f.load(expectedResourceName)
+				f.load(string(expectedResourceName))
 				var imageOpt interface{}
 				if test.expectImage {
-					imageOpt = db(image("docker.io/test/mycrd-env"))
+					imageOpt = db(image("test/mycrd-env"))
 				} else {
 					imageOpt = funcOpt(func(t *testing.T, m model.Manifest) bool {
 						return assert.Equal(t, 0, len(m.ImageTargets))
@@ -1918,7 +2159,7 @@ k8s_kind(%s)
 					t.Fatal("invalid test: cannot expect image without expecting workload")
 				}
 				if test.expectedError == "" {
-					w := unusedImageWarning("docker.io/test/mycrd-env", []string{"docker.io/library/golang"})
+					w := unusedImageWarning("test/mycrd-env", []string{})
 					f.loadAssertWarnings(w)
 				} else {
 					f.loadErrString(test.expectedError)
@@ -1959,10 +2200,10 @@ docker_build('test/mycrd-env', 'env')
 	f.load("mycrd")
 	f.assertNextManifest("mycrd",
 		db(
-			image("docker.io/test/mycrd-env"),
+			image("test/mycrd-env"),
 		),
 		db(
-			image("docker.io/test/mycrd-builder"),
+			image("test/mycrd-builder"),
 		),
 		k8sObject("mycrd", "Environment"),
 	)
@@ -2026,7 +2267,7 @@ docker_build('gcr.io/foo-fetcher', 'foo-fetcher', match_in_env_vars=True)
 	)
 }
 
-func TestExtraImageLocationDeploymentEnvVarDoesntMatchIfNotSpecified(t *testing.T) {
+func TestExtraImageLocationDeploymentEnvVarDoesNotMatchIfNotSpecified(t *testing.T) {
 	f := newFixture(t)
 	defer f.TearDown()
 
@@ -2039,7 +2280,7 @@ func TestExtraImageLocationDeploymentEnvVarDoesntMatchIfNotSpecified(t *testing.
 docker_build('gcr.io/foo', 'foo')
 docker_build('gcr.io/foo-fetcher', 'foo-fetcher')
 	`)
-	f.loadAssertWarnings(unusedImageWarning("gcr.io/foo-fetcher", []string{"gcr.io/foo", "docker.io/library/golang"}))
+	f.loadAssertWarnings(unusedImageWarning("gcr.io/foo-fetcher", []string{"gcr.io/foo"}))
 	f.assertNextManifest("foo",
 		db(
 			image("gcr.io/foo"),
@@ -2101,7 +2342,7 @@ k8s_image_json_path("{.spec.template.spec.containers[*].env[?(@.name=='FETCHER_I
 				)
 			} else {
 				if test.expectedError == "" {
-					w := unusedImageWarning("gcr.io/foo-fetcher", []string{"gcr.io/foo", "docker.io/library/golang"})
+					w := unusedImageWarning("gcr.io/foo-fetcher", []string{"gcr.io/foo"})
 					f.loadAssertWarnings(w)
 				} else {
 					f.loadErrString(test.expectedError)
@@ -2210,189 +2451,13 @@ k8s_yaml('')
 	f.loadErrString("error reading yaml file")
 }
 
-func TestParseJSON(t *testing.T) {
-	f := newFixture(t)
-	defer f.TearDown()
-
-	f.setupFooAndBar()
-	f.file("Tiltfile", `
-result = decode_json('["foo", {"baz":["bar", "", 1, 2]}]')
-
-docker_build('gcr.io/foo', 'foo')
-k8s_yaml(result[0] + '.yaml')
-
-docker_build('gcr.io/bar', 'bar')
-k8s_yaml(result[1]["baz"][0] + '.yaml')
-`)
-
-	f.load()
-
-	f.assertNextManifest("foo",
-		db(image("gcr.io/foo")),
-		deployment("foo"))
-
-	f.assertNextManifest("bar",
-		db(image("gcr.io/bar")),
-		deployment("bar"))
-	f.assertConfigFiles("Tiltfile", ".tiltignore", "foo/Dockerfile", "foo/.dockerignore", "foo.yaml", "bar/Dockerfile", "bar/.dockerignore", "bar.yaml")
-}
-
-func TestReadYAML(t *testing.T) {
-	f := newFixture(t)
-	defer f.TearDown()
-
-	f.setupFooAndBar()
-	var document = `
-key1: foo
-key2:
-    key3: "bar"
-    key4: true
-key5: 3
-`
-	f.file("options.yaml", document)
-
-	f.file("Tiltfile", `
-result = read_yaml("options.yaml")
-
-docker_build('gcr.io/foo', 'foo')
-k8s_yaml(result['key1'] + '.yaml')
-docker_build('gcr.io/bar', 'bar')
-
-if result['key2']['key4'] and result['key5'] == 3:
-		k8s_yaml(result['key2']['key3'] + '.yaml')
-`)
-
-	f.load()
-
-	f.assertNextManifest("foo",
-		db(image("gcr.io/foo")),
-		deployment("foo"))
-
-	f.assertNextManifest("bar",
-		db(image("gcr.io/bar")),
-		deployment("bar"))
-	f.assertConfigFiles("Tiltfile", ".tiltignore", "foo/Dockerfile", "foo/.dockerignore", "foo.yaml", "bar/Dockerfile", "bar/.dockerignore", "bar.yaml", "options.yaml")
-}
-
-func TestYAMLDoesntExist(t *testing.T) {
-	f := newFixture(t)
-	defer f.TearDown()
-
-	f.setupFooAndBar()
-	f.file("Tiltfile", `
-result = read_yaml("dne.yaml")
-
-docker_build('gcr.io/foo', 'foo')
-k8s_yaml(result['key1'] + '.yaml')
-docker_build('gcr.io/bar', 'bar')
-
-if result['key2']['key4'] and result['key5'] == 3:
-		k8s_yaml(result['key2']['key3'] + '.yaml')
-`)
-	f.loadErrString("dne.yaml: no such file or directory")
-
-	f.assertConfigFiles("Tiltfile", ".tiltignore", "dne.yaml")
-}
-
-func TestMalformedYAML(t *testing.T) {
-	f := newFixture(t)
-	defer f.TearDown()
-
-	f.setupFooAndBar()
-	var document = `
-key1: foo
-key2:
-    key3: "bar
-    key4: true
-key5: 3
-`
-	f.file("options.yaml", document)
-
-	f.file("Tiltfile", `
-result = read_yaml("options.yaml")
-
-docker_build('gcr.io/foo', 'foo')
-k8s_yaml(result['key1'] + '.yaml')
-docker_build('gcr.io/bar', 'bar')
-
-if result['key2']['key4'] and result['key5'] == 3:
-		k8s_yaml(result['key2']['key3'] + '.yaml')
-`)
-	f.loadErrString("error parsing YAML: error converting YAML to JSON: yaml: line 7: found unexpected end of stream in options.yaml")
-}
-
-func TestReadJSON(t *testing.T) {
-	f := newFixture(t)
-	defer f.TearDown()
-
-	f.setupFooAndBar()
-	f.file("options.json", `["foo", {"baz":["bar", "", 1, 2]}]`)
-	f.file("Tiltfile", `
-result = read_json("options.json")
-
-docker_build('gcr.io/foo', 'foo')
-k8s_yaml(result[0] + '.yaml')
-
-docker_build('gcr.io/bar', 'bar')
-k8s_yaml(result[1]["baz"][0] + '.yaml')
-`)
-
-	f.load()
-
-	f.assertNextManifest("foo",
-		db(image("gcr.io/foo")),
-		deployment("foo"))
-
-	f.assertNextManifest("bar",
-		db(image("gcr.io/bar")),
-		deployment("bar"))
-	f.assertConfigFiles("Tiltfile", ".tiltignore", "foo/Dockerfile", "foo/.dockerignore", "foo.yaml", "bar/Dockerfile", "bar/.dockerignore", "bar.yaml", "options.json")
-}
-
-func TestJSONDoesntExist(t *testing.T) {
-	f := newFixture(t)
-	defer f.TearDown()
-
-	f.setupFooAndBar()
-	f.file("Tiltfile", `
-result = read_json("dne.json")
-
-docker_build('gcr.io/foo', 'foo')
-k8s_resource(result[0], 'foo.yaml')
-
-docker_build('gcr.io/bar', 'bar')
-k8s_resource(result[1]["baz"][0], 'bar.yaml')
-`)
-	f.loadErrString("dne.json: no such file or directory")
-
-	f.assertConfigFiles("Tiltfile", ".tiltignore", "dne.json")
-}
-
-func TestMalformedJSON(t *testing.T) {
-	f := newFixture(t)
-	defer f.TearDown()
-
-	f.setupFooAndBar()
-	f.file("options.json", `["foo", {"baz":["bar", "", 1, 2]}`)
-	f.file("Tiltfile", `
-result = read_json("options.json")
-
-docker_build('gcr.io/foo', 'foo')
-k8s_resource(result[0], 'foo.yaml')
-
-docker_build('gcr.io/bar', 'bar')
-k8s_resource(result[1]["baz"][0], 'bar.yaml')
-`)
-	f.loadErrString("JSON parsing error: unexpected end of JSON input")
-}
-
 func TestTwoDefaultRegistries(t *testing.T) {
 	f := newFixture(t)
 	defer f.TearDown()
 
 	f.file("Tiltfile", `
-default_registry("foo")
-default_registry("bar")`)
+default_registry("gcr.io")
+default_registry("docker.io")`)
 
 	f.loadErrString("default registry already defined")
 }
@@ -2407,7 +2472,25 @@ default_registry("foo")
 docker_build('gcr.io/foo', 'foo')
 `)
 
-	f.loadErrString("repository name must be canonical")
+	f.loadErrString("Traceback ", "repository name must be canonical")
+}
+
+func TestDefaultRegistryHostFromCluster(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.setupFoo()
+	f.file("Tiltfile", `
+default_registry("abc.io", host_from_cluster="def.io")
+k8s_yaml('foo.yaml')
+docker_build('gcr.io/foo', 'foo')
+`)
+
+	f.load()
+
+	f.assertNextManifest("foo",
+		db(image("gcr.io/foo").withLocalRef("abc.io/gcr.io_foo").withClusterRef("def.io/gcr.io_foo")),
+		deployment("foo"))
 }
 
 func TestDefaultRegistryAtEndOfTiltfile(t *testing.T) {
@@ -2425,20 +2508,20 @@ default_registry('bar.com')
 	f.load()
 
 	f.assertNextManifest("foo",
-		db(image("gcr.io/foo").withInjectedRef("bar.com/gcr.io_foo")),
+		db(image("gcr.io/foo").withLocalRef("bar.com/gcr.io_foo")),
 		deployment("foo"))
 	f.assertConfigFiles("Tiltfile", ".tiltignore", "foo/Dockerfile", "foo/.dockerignore", "foo.yaml")
 }
 
-func TestPrivateRegistry(t *testing.T) {
+func TestLocalRegistry(t *testing.T) {
 	f := newFixture(t)
 	defer f.TearDown()
 
-	f.kCli.Registry = "localhost:32000"
+	f.kCli.Registry = container.MustNewRegistry("localhost:32000")
 
 	f.setupFoo()
 	f.file("Tiltfile", `
-default_registry('bar.com')
+default_registry('bar.com')  # localRegistry should override this
 docker_build('gcr.io/foo', 'foo')
 k8s_yaml('foo.yaml')
 `)
@@ -2446,15 +2529,15 @@ k8s_yaml('foo.yaml')
 	f.load()
 
 	f.assertNextManifest("foo",
-		db(image("gcr.io/foo").withInjectedRef("localhost:32000/gcr.io_foo")),
+		db(image("gcr.io/foo").withLocalRef("localhost:32000/gcr.io_foo")),
 		deployment("foo"))
 }
 
-func TestPrivateRegistryDockerCompose(t *testing.T) {
+func TestLocalRegistryDockerCompose(t *testing.T) {
 	f := newFixture(t)
 	defer f.TearDown()
 
-	f.kCli.Registry = "localhost:32000"
+	f.kCli.Registry = container.MustNewRegistry("localhost:32000")
 
 	f.setupFoo()
 	f.file("docker-compose.yml", `version: '3'
@@ -2498,26 +2581,12 @@ default_registry('example.com')
 	f.load()
 
 	f.assertNextManifest("bar",
-		db(image("gcr.io/foo:bar").withInjectedRef("example.com/gcr.io_foo")),
+		db(image("gcr.io/foo:bar").withLocalRef("example.com/gcr.io_foo")),
 		deployment("bar"))
 	f.assertNextManifest("baz",
-		db(image("gcr.io/foo:baz").withInjectedRef("example.com/gcr.io_foo")),
+		db(image("gcr.io/foo:baz").withLocalRef("example.com/gcr.io_foo")),
 		deployment("baz"))
 	f.assertConfigFiles("Tiltfile", ".tiltignore", "bar/Dockerfile", "bar/.dockerignore", "bar.yaml", "baz/Dockerfile", "baz/.dockerignore", "baz.yaml")
-}
-
-func TestDefaultRegistryWithDockerCompose(t *testing.T) {
-	f := newFixture(t)
-	defer f.TearDown()
-
-	f.dockerfile("foo/Dockerfile")
-	f.file("docker-compose.yml", simpleConfig)
-	f.file("Tiltfile", `
-docker_compose('docker-compose.yml')
-default_registry('bar.com')
-`)
-
-	f.loadErrString("default_registry is not supported with docker compose")
 }
 
 func TestDefaultReadFile(t *testing.T) {
@@ -2528,28 +2597,6 @@ func TestDefaultReadFile(t *testing.T) {
 result = read_file("this_file_does_not_exist", default="foo")
 docker_build('gcr.io/foo', 'foo')
 k8s_yaml(str(result) + '.yaml')
-`
-
-	f.file("Tiltfile", tiltfile)
-
-	f.load()
-
-	f.assertNextManifest("foo",
-		db(image("gcr.io/foo")),
-		deployment("foo"))
-
-	f.assertConfigFiles("Tiltfile", ".tiltignore", "this_file_does_not_exist", "foo.yaml", "foo/Dockerfile", "foo/.dockerignore")
-}
-
-func TestDefaultReadJSON(t *testing.T) {
-	f := newFixture(t)
-	defer f.TearDown()
-
-	f.setupFooAndBar()
-	tiltfile := `
-result = read_json("this_file_does_not_exist", default={"name": "foo"})
-docker_build('gcr.io/foo', 'foo')
-k8s_yaml(str(result["name"]) + '.yaml')
 `
 
 	f.file("Tiltfile", tiltfile)
@@ -2991,11 +3038,14 @@ func TestTriggerModeK8S(t *testing.T) {
 	}{
 		{"default", TriggerModeUnset, TriggerModeUnset, model.TriggerModeAuto},
 		{"explicit global auto", TriggerModeAuto, TriggerModeUnset, model.TriggerModeAuto},
-		{"explicit global manual", TriggerModeManual, TriggerModeUnset, model.TriggerModeManual},
+		{"explicit global manual", TriggerModeManual, TriggerModeUnset, model.TriggerModeManualAfterInitial},
+		{"explicit global manual after initial", TriggerModeManual, TriggerModeUnset, model.TriggerModeManualAfterInitial},
 		{"kr auto", TriggerModeUnset, TriggerModeUnset, model.TriggerModeAuto},
-		{"kr manual", TriggerModeUnset, TriggerModeManual, model.TriggerModeManual},
+		{"kr manual", TriggerModeUnset, TriggerModeManual, model.TriggerModeManualAfterInitial},
+		{"kr manual after initial", TriggerModeUnset, TriggerModeManual, model.TriggerModeManualAfterInitial},
 		{"kr override auto", TriggerModeManual, TriggerModeAuto, model.TriggerModeAuto},
-		{"kr override manual", TriggerModeAuto, TriggerModeManual, model.TriggerModeManual},
+		{"kr override manual", TriggerModeAuto, TriggerModeManual, model.TriggerModeManualAfterInitial},
+		{"kr override manual after initial", TriggerModeAuto, TriggerModeManual, model.TriggerModeManualAfterInitial},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			f := newFixture(t)
@@ -3007,20 +3057,16 @@ func TestTriggerModeK8S(t *testing.T) {
 			switch testCase.globalSetting {
 			case TriggerModeUnset:
 				globalTriggerModeDirective = ""
-			case TriggerModeManual:
-				globalTriggerModeDirective = "trigger_mode(TRIGGER_MODE_MANUAL)"
-			case TriggerModeAuto:
-				globalTriggerModeDirective = "trigger_mode(TRIGGER_MODE_AUTO)"
+			default:
+				globalTriggerModeDirective = fmt.Sprintf("trigger_mode(%s)", testCase.globalSetting.String())
 			}
 
 			var k8sResourceDirective string
 			switch testCase.k8sResourceSetting {
 			case TriggerModeUnset:
 				k8sResourceDirective = ""
-			case TriggerModeManual:
-				k8sResourceDirective = "k8s_resource('foo', trigger_mode=TRIGGER_MODE_MANUAL)"
-			case TriggerModeAuto:
-				k8sResourceDirective = "k8s_resource('foo', trigger_mode=TRIGGER_MODE_AUTO)"
+			default:
+				k8sResourceDirective = fmt.Sprintf("k8s_resource('foo', trigger_mode=%s)", testCase.k8sResourceSetting.String())
 			}
 
 			f.file("Tiltfile", fmt.Sprintf(`
@@ -3038,27 +3084,30 @@ k8s_yaml('foo.yaml')
 	}
 }
 
-func TestTriggerModeDC(t *testing.T) {
+func TestTriggerModeLocal(t *testing.T) {
 	for _, testCase := range []struct {
-		name                string
-		globalSetting       triggerMode
-		dcResourceSetting   triggerMode
-		expectedTriggerMode model.TriggerMode
+		name                 string
+		globalSetting        triggerMode
+		localResourceSetting triggerMode
+		specifyAutoInit      bool
+		autoInit             bool
+		expectedTriggerMode  model.TriggerMode
 	}{
-		{"default", TriggerModeUnset, TriggerModeUnset, model.TriggerModeAuto},
-		{"explicit global auto", TriggerModeAuto, TriggerModeUnset, model.TriggerModeAuto},
-		{"explicit global manual", TriggerModeManual, TriggerModeUnset, model.TriggerModeManual},
-		{"dc auto", TriggerModeUnset, TriggerModeUnset, model.TriggerModeAuto},
-		{"dc manual", TriggerModeUnset, TriggerModeManual, model.TriggerModeManual},
-		{"dc override auto", TriggerModeManual, TriggerModeAuto, model.TriggerModeAuto},
-		{"dc override manual", TriggerModeAuto, TriggerModeManual, model.TriggerModeManual},
+		{"default", TriggerModeUnset, TriggerModeUnset, false, true, model.TriggerModeAuto},
+		{"explicit global auto", TriggerModeAuto, TriggerModeUnset, false, true, model.TriggerModeAuto},
+		{"explicit global manual", TriggerModeManual, TriggerModeUnset, false, true, model.TriggerModeManualAfterInitial},
+		{"explicit global manual, autoInit=True", TriggerModeManual, TriggerModeUnset, true, true, model.TriggerModeManualAfterInitial},
+		{"explicit global manual, autoInit=False", TriggerModeManual, TriggerModeUnset, true, false, model.TriggerModeManualIncludingInitial},
+		{"local_resource auto", TriggerModeUnset, TriggerModeUnset, false, true, model.TriggerModeAuto},
+		{"local_resource manual", TriggerModeUnset, TriggerModeManual, false, true, model.TriggerModeManualAfterInitial},
+		{"local_resource manual, autoInit=True", TriggerModeUnset, TriggerModeManual, true, true, model.TriggerModeManualAfterInitial},
+		{"local_resource manual, autoInit=False", TriggerModeUnset, TriggerModeManual, true, false, model.TriggerModeManualIncludingInitial},
+		{"local_resource override auto", TriggerModeManual, TriggerModeAuto, false, true, model.TriggerModeAuto},
+		{"local_resource override manual", TriggerModeAuto, TriggerModeManual, false, true, model.TriggerModeManualAfterInitial},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			f := newFixture(t)
 			defer f.TearDown()
-
-			f.dockerfile("foo/Dockerfile")
-			f.file("docker-compose.yml", simpleConfig)
 
 			var globalTriggerModeDirective string
 			switch testCase.globalSetting {
@@ -3070,21 +3119,29 @@ func TestTriggerModeDC(t *testing.T) {
 				globalTriggerModeDirective = "trigger_mode(TRIGGER_MODE_AUTO)"
 			}
 
-			var dcResourceDirective string
-			switch testCase.dcResourceSetting {
-			case TriggerModeUnset:
-				dcResourceDirective = ""
+			resourceTriggerModeArg := ""
+			switch testCase.localResourceSetting {
 			case TriggerModeManual:
-				dcResourceDirective = "dc_resource('foo', 'gcr.io/foo', trigger_mode=TRIGGER_MODE_MANUAL)"
+				resourceTriggerModeArg = ", trigger_mode=TRIGGER_MODE_MANUAL"
 			case TriggerModeAuto:
-				dcResourceDirective = "dc_resource('foo', 'gcr.io/foo', trigger_mode=TRIGGER_MODE_AUTO)"
+				resourceTriggerModeArg = ", trigger_mode=TRIGGER_MODE_AUTO"
 			}
+
+			autoInitArg := ""
+			if testCase.specifyAutoInit {
+				if testCase.autoInit {
+					autoInitArg = ", auto_init=True"
+				} else {
+					autoInitArg = ", auto_init=False"
+				}
+			}
+
+			localResourceDirective := fmt.Sprintf("local_resource('foo', 'echo hi'%s%s)", resourceTriggerModeArg, autoInitArg)
 
 			f.file("Tiltfile", fmt.Sprintf(`
 %s
-docker_compose('docker-compose.yml')
 %s
-`, globalTriggerModeDirective, dcResourceDirective))
+`, globalTriggerModeDirective, localResourceDirective))
 
 			f.load()
 
@@ -3092,6 +3149,14 @@ docker_compose('docker-compose.yml')
 			f.assertNextManifest("foo", testCase.expectedTriggerMode)
 		})
 	}
+}
+
+func TestLocalResourceAutoTriggerModeAutoInitFalse(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.file("Tiltfile", fmt.Sprintf(`local_resource("foo", "echo hi", auto_init=False)`))
+	f.loadErrString("auto_init=False incompatible with trigger_mode=TRIGGER_MODE_AUTO")
 }
 
 func TestTriggerModeInt(t *testing.T) {
@@ -3135,7 +3200,23 @@ k8s_yaml(yml)
 	)
 }
 
+// There's a major helm regression that's breaking everything
+// https://github.com/helm/helm/issues/6708
+func isBuggyHelm(t *testing.T) bool {
+	cmd := exec.Command("helm", "version", "-c", "--short")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("Error running helm: %v", err)
+	}
+
+	return strings.Contains(string(out), "v2.15.0")
+}
+
 func TestHelmIncludesRequirements(t *testing.T) {
+	if isBuggyHelm(t) {
+		t.Skipf("Helm v2.15.0 has a major regression, skipping test. See: https://github.com/helm/helm/issues/6708")
+	}
+
 	f := newFixture(t)
 	defer f.TearDown()
 
@@ -3474,7 +3555,7 @@ func TestDisableFeature(t *testing.T) {
 	f.assertFeature("testflag_enabled", false)
 }
 
-func TestEnableFeatureThatDoesntExist(t *testing.T) {
+func TestEnableFeatureThatDoesNotExist(t *testing.T) {
 	f := newFixture(t)
 	f.setupFoo()
 
@@ -3483,7 +3564,7 @@ func TestEnableFeatureThatDoesntExist(t *testing.T) {
 	f.loadErrString("Unknown feature flag: testflag")
 }
 
-func TestDisableFeatureThatDoesntExist(t *testing.T) {
+func TestDisableFeatureThatDoesNotExist(t *testing.T) {
 	f := newFixture(t)
 	f.setupFoo()
 
@@ -3510,7 +3591,7 @@ func TestDisableSnapshots(t *testing.T) {
 	f.assertFeature(feature.Snapshots, false)
 }
 
-func TestDockerBuildEntrypoint(t *testing.T) {
+func TestDockerBuildEntrypointString(t *testing.T) {
 	f := newFixture(t)
 	defer f.TearDown()
 
@@ -3522,7 +3603,41 @@ k8s_yaml('foo.yaml')
 `)
 
 	f.load()
-	f.assertNextManifest("foo", db(image("gcr.io/foo"), entrypoint("/bin/the_app")))
+	f.assertNextManifest("foo", db(image("gcr.io/foo"), entrypoint(model.ToShellCmd("/bin/the_app"))))
+}
+
+func TestDockerBuildContainerArgs(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.dockerfile("Dockerfile")
+	f.yaml("foo.yaml", deployment("foo", image("gcr.io/foo")))
+	f.file("Tiltfile", `
+docker_build('gcr.io/foo', '.', container_args=["bar"])
+k8s_yaml('foo.yaml')
+`)
+
+	f.load()
+
+	m := f.assertNextManifest("foo")
+	assert.Equal(t,
+		model.OverrideArgs{ShouldOverride: true, Args: []string{"bar"}},
+		m.ImageTargets[0].OverrideArgs)
+}
+
+func TestDockerBuildEntrypointArray(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.dockerfile("Dockerfile")
+	f.yaml("foo.yaml", deployment("foo", image("gcr.io/foo")))
+	f.file("Tiltfile", `
+docker_build('gcr.io/foo', '.', entrypoint=["/bin/the_app"])
+k8s_yaml('foo.yaml')
+`)
+
+	f.load()
+	f.assertNextManifest("foo", db(image("gcr.io/foo"), entrypoint(model.Cmd{Argv: []string{"/bin/the_app"}})))
 }
 
 func TestDockerBuild_buildArgs(t *testing.T) {
@@ -3562,8 +3677,26 @@ k8s_yaml('foo.yaml')
 		image("gcr.io/foo"),
 		deps(f.JoinPath("foo")),
 		cmd("docker build -t $EXPECTED_REF foo"),
-		entrypoint("/bin/the_app")),
+		entrypoint(model.ToShellCmd("/bin/the_app"))),
 	)
+}
+
+func TestCustomBuildContainerArgs(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.dockerfile("Dockerfile")
+	f.yaml("foo.yaml", deployment("foo", image("gcr.io/foo")))
+	f.file("Tiltfile", `
+custom_build('gcr.io/foo', 'docker build -t $EXPECTED_REF foo',
+ ['foo'], container_args=['bar'])
+k8s_yaml('foo.yaml')
+`)
+
+	f.load()
+	assert.Equal(t,
+		model.OverrideArgs{ShouldOverride: true, Args: []string{"bar"}},
+		f.assertNextManifest("foo").ImageTargets[0].OverrideArgs)
 }
 
 func TestDuplicateResource(t *testing.T) {
@@ -3584,9 +3717,7 @@ k8s_yaml('resource.yaml')
 	m := f.assertNextManifestUnresourced("doggos", "doggos")
 
 	displayNames := []string{}
-	for _, name := range m.K8sTarget().DisplayNames {
-		displayNames = append(displayNames, name)
-	}
+	displayNames = append(displayNames, m.K8sTarget().DisplayNames...)
 	assert.Equal(t, []string{"doggos:service:default::0", "doggos:service:default::1"}, displayNames)
 }
 
@@ -3629,7 +3760,8 @@ func TestK8SContextAcceptance(t *testing.T) {
 	}{
 		{"minikube", "minikube", k8s.EnvMinikube, false, nil},
 		{"docker-for-desktop", "docker-for-desktop", k8s.EnvDockerDesktop, false, nil},
-		{"kind", "KIND", k8s.EnvKIND, false, nil},
+		{"kind", "KIND", k8s.EnvKIND6, false, nil},
+		{"kind", "KIND", k8s.EnvKIND5, false, nil},
 		{"gke", "gke", k8s.EnvGKE, true, []string{"'gke'", "If you're sure", "switch k8s contexts", "allow_k8s_contexts"}},
 		{"allowed", "allowed-context", k8s.EnvGKE, false, nil},
 	} {
@@ -3687,12 +3819,12 @@ local('echo hi')
 	}
 }
 
-func TestLocalResource(t *testing.T) {
+func TestLocalResourceOnlyUpdateCmd(t *testing.T) {
 	f := newFixture(t)
 	defer f.TearDown()
 
 	f.file("Tiltfile", `
-local_resource("test", "echo hi", ["foo/bar", "foo/a.txt"])
+local_resource("test", "echo hi", deps=["foo/bar", "foo/a.txt"])
 `)
 
 	f.setupFoo()
@@ -3700,29 +3832,83 @@ local_resource("test", "echo hi", ["foo/bar", "foo/a.txt"])
 	f.load()
 
 	f.assertNumManifests(1)
+	path1 := "foo/bar"
+	path2 := "foo/a.txt"
+	m := f.assertNextManifest("test", localTarget(updateCmd("echo hi"), deps(path1, path2)), fileChangeMatches("foo/a.txt"))
 
-	// TODO(dmiller): make the rest of these assertion helpers like the other manifest helpers
-	m := f.loadResult.Manifests[0]
-	require.Equal(t, "test", m.Name.String())
 	lt := m.LocalTarget()
-	path1 := f.JoinPath("foo/bar")
-	path2 := f.JoinPath("foo/a.txt")
-	require.Equal(t, []string{"sh", "-c", "echo hi"}, lt.Cmd.Argv)
-	require.Equal(t, []string{path2, path1}, lt.Dependencies())
 	f.assertRepos([]string{f.Path()}, lt.LocalRepos())
 
 	f.assertConfigFiles("Tiltfile", ".tiltignore")
+}
 
-	filter, err := ignore.CreateFileChangeFilter(lt)
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestLocalResourceOnlyServeCmd(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
 
-	matches, err := filter.Matches(path2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	require.Equal(t, false, matches)
+	f.file("Tiltfile", `
+local_resource("test", serve_cmd="sleep 1000")
+`)
+
+	f.load()
+
+	f.assertNumManifests(1)
+	f.assertNextManifest("test", localTarget(serveCmd("sleep 1000")))
+
+	f.assertConfigFiles("Tiltfile", ".tiltignore")
+}
+
+func TestLocalResourceUpdateAndServeCmd(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.file("Tiltfile", `
+local_resource("test", cmd="echo hi", serve_cmd="sleep 1000")
+`)
+
+	f.load()
+
+	f.assertNumManifests(1)
+	f.assertNextManifest("test", localTarget(updateCmd("echo hi"), serveCmd("sleep 1000")))
+
+	f.assertConfigFiles("Tiltfile", ".tiltignore")
+}
+
+func TestLocalResourceNeitherUpdateOrServeCmd(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.file("Tiltfile", `
+local_resource("test")
+`)
+
+	f.loadErrString("local_resource must have a cmd and/or a serve_cmd, but both were empty")
+}
+
+func TestLocalResourceUpdateCmdArray(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.file("Tiltfile", `
+local_resource("test", ["echo", "hi"])
+`)
+
+	f.load()
+	f.assertNumManifests(1)
+	f.assertNextManifest("test", localTarget(updateCmdArray("echo", "hi")))
+}
+
+func TestLocalResourceServeCmdArray(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.file("Tiltfile", `
+local_resource("test", serve_cmd=["echo", "hi"])
+`)
+
+	f.load()
+	f.assertNumManifests(1)
+	f.assertNextManifest("test", localTarget(serveCmdArray("echo", "hi")))
 }
 
 func TestLocalResourceWorkdir(t *testing.T) {
@@ -3730,11 +3916,11 @@ func TestLocalResourceWorkdir(t *testing.T) {
 	defer f.TearDown()
 
 	f.file("nested/Tiltfile", `
-local_resource("nested-local", "echo nested", ["foo/bar", "more_nested/repo"])
+local_resource("nested-local", "echo nested", deps=["foo/bar", "more_nested/repo"])
 `)
 	f.file("Tiltfile", `
 include('nested/Tiltfile')
-local_resource("toplvl-local", "echo hello world", ["foo/baz", "foo/a.txt"])
+local_resource("toplvl-local", "echo hello world", deps=["foo/baz", "foo/a.txt"])
 `)
 
 	f.setupFoo()
@@ -3745,34 +3931,82 @@ local_resource("toplvl-local", "echo hello world", ["foo/baz", "foo/a.txt"])
 	f.load()
 
 	f.assertNumManifests(2)
+	mNested := f.assertNextManifest("nested-local", localTarget(updateCmd("echo nested"), deps("nested/foo/bar", "nested/more_nested/repo")))
 
-	// TODO(dmiller): make the rest of these assertion helpers like the other manifest helpers
-	mNested := f.loadResult.Manifests[0]
-	require.Equal(t, "nested-local", mNested.Name.String())
 	ltNested := mNested.LocalTarget()
-	require.Equal(t, []string{"sh", "-c", "echo nested"}, ltNested.Cmd.Argv)
-	require.ElementsMatch(t, []string{
-		f.JoinPath("nested/foo/bar"),
-		f.JoinPath("nested/more_nested/repo"),
-	}, ltNested.Dependencies())
 	f.assertRepos([]string{
 		f.JoinPath("nested"),
 		f.JoinPath("nested/more_nested/repo"),
 	}, ltNested.LocalRepos())
 
-	mTop := f.loadResult.Manifests[1]
-	require.Equal(t, "toplvl-local", mTop.Name.String())
+	mTop := f.assertNextManifest("toplvl-local", localTarget(updateCmd("echo hello world"), deps("foo/baz", "foo/a.txt")))
 	ltTop := mTop.LocalTarget()
-	require.Equal(t, []string{"sh", "-c", "echo hello world"}, ltTop.Cmd.Argv)
-	require.ElementsMatch(t, []string{
-		f.JoinPath("foo/baz"),
-		f.JoinPath("foo/a.txt"),
-	}, ltTop.Dependencies())
-	spew.Dump(ltTop.LocalRepos())
 	f.assertRepos([]string{
 		f.JoinPath("foo/baz"),
 		f.Path(),
 	}, ltTop.LocalRepos())
+}
+
+func TestLocalResourceIgnore(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.file(".dockerignore", "**/**.c")
+	f.file("Tiltfile", "include('proj/Tiltfile')")
+	f.file("proj/Tiltfile", `
+local_resource("test", "echo hi", deps=["foo"], ignore=["**/*.a", "foo/bar.d"])
+`)
+
+	f.setupFoo()
+	f.file(".gitignore", "*.txt")
+	f.load()
+
+	m := f.assertNextManifest("test")
+
+	// TODO(dmiller): I can't figure out how to translate these in to (file\build)(Matches\Filters) assert functions
+	filter, err := ignore.CreateFileChangeFilter(m.LocalTarget())
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		path        string
+		expectMatch bool
+	}{
+		{"proj/foo/bar.a", true},
+		{"proj/foo/bar.b", false},
+		{"proj/foo/baz/bar.a", true},
+		{"proj/foo/bar.d", true},
+	} {
+		matches, err := filter.Matches(f.JoinPath(tc.path))
+		require.NoError(t, err)
+		require.Equal(t, tc.expectMatch, matches, tc.path)
+	}
+}
+
+func TestCustomBuildStoresTiltfilePath(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.file("Tiltfile", `include('proj/Tiltfile')
+k8s_yaml("foo.yaml")`)
+	f.file("proj/Tiltfile", `
+custom_build(
+  'gcr.io/foo',
+  'build.sh',
+  ['foo']
+)
+`)
+	f.file("proj/build.sh", "docker build -t $EXPECTED_REF gcr.io/foo")
+	f.file("proj/Dockerfile", "FROM alpine")
+	f.yaml("foo.yaml", deployment("foo", image("gcr.io/foo")))
+
+	f.load()
+	f.assertNumManifests(1)
+	f.assertNextManifest("foo", cb(
+		image("gcr.io/foo"),
+		deps(f.JoinPath("proj/foo")),
+		cmd("build.sh"),
+		workdir(f.JoinPath("proj")),
+	))
 }
 
 func (f *fixture) assertRepos(expectedLocalPaths []string, repos []model.LocalGitRepo) {
@@ -3780,7 +4014,6 @@ func (f *fixture) assertRepos(expectedLocalPaths []string, repos []model.LocalGi
 	for _, r := range repos {
 		actualLocalPaths = append(actualLocalPaths, r.LocalPath)
 	}
-	spew.Dump(actualLocalPaths)
 	assert.ElementsMatch(f.t, expectedLocalPaths, actualLocalPaths)
 }
 
@@ -3842,6 +4075,292 @@ k8s_yaml('secret.yaml')
 	assert.Equal(t, "d29ybGQ=", string(secrets["world"].ValueEncoded))
 }
 
+func TestDockerPruneSettings(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.file("Tiltfile", `
+docker_prune_settings(max_age_mins=111, num_builds=222)
+`)
+
+	f.load()
+	res := f.loadResult.DockerPruneSettings
+
+	assert.True(t, res.Enabled)
+	assert.Equal(t, time.Minute*111, res.MaxAge)
+	assert.Equal(t, 222, res.NumBuilds)
+	assert.Equal(t, model.DockerPruneDefaultInterval, res.Interval) // default
+}
+
+func TestDockerPruneSettingsDefaultsWhenCalled(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.file("Tiltfile", `
+docker_prune_settings(num_builds=123)
+`)
+
+	f.load()
+	res := f.loadResult.DockerPruneSettings
+
+	assert.True(t, res.Enabled)
+	assert.Equal(t, model.DockerPruneDefaultMaxAge, res.MaxAge)
+	assert.Equal(t, 123, res.NumBuilds)
+	assert.Equal(t, model.DockerPruneDefaultInterval, res.Interval)
+}
+
+func TestDockerPruneSettingsDefaultsWhenNotCalled(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.file("Tiltfile", `
+print('nothing to see here')
+`)
+
+	f.load()
+	res := f.loadResult.DockerPruneSettings
+
+	assert.True(t, res.Enabled)
+	assert.Equal(t, model.DockerPruneDefaultMaxAge, res.MaxAge)
+	assert.Equal(t, 0, res.NumBuilds)
+	assert.Equal(t, model.DockerPruneDefaultInterval, res.Interval)
+}
+
+func TestK8SDependsOn(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.setupFooAndBar()
+	f.file("Tiltfile", `
+docker_build('gcr.io/foo', 'foo')
+k8s_yaml('foo.yaml')
+
+docker_build('gcr.io/bar', 'bar')
+k8s_yaml('bar.yaml')
+k8s_resource('bar', resource_deps=['foo'])
+`)
+
+	f.load()
+	f.assertNextManifest("foo", resourceDeps())
+	f.assertNextManifest("bar", resourceDeps("foo"))
+}
+
+func TestLocalDependsOn(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.file("Tiltfile", `
+local_resource('foo', 'echo foo')
+local_resource('bar', 'echo bar', resource_deps=['foo'])
+`)
+
+	f.load()
+	f.assertNextManifest("foo", resourceDeps())
+	f.assertNextManifest("bar", resourceDeps("foo"))
+}
+
+func TestDependsOnMissingResource(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.file("Tiltfile", `
+local_resource('bar', 'echo bar', resource_deps=['foo'])
+`)
+
+	f.loadErrString("resource bar specified a dependency on unknown resource fo")
+}
+
+func TestDependsOnSelf(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.file("Tiltfile", `
+local_resource('bar', 'echo bar', resource_deps=['bar'])
+`)
+
+	f.loadErrString("resource bar specified a dependency on itself")
+}
+
+func TestDependsOnCycle(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.file("Tiltfile", `
+local_resource('foo', 'echo foo', resource_deps=['baz'])
+local_resource('bar', 'echo bar', resource_deps=['foo'])
+local_resource('baz', 'echo baz', resource_deps=['bar'])
+`)
+
+	f.loadErrString("cycle detected in resource dependency graph", "bar -> foo", "foo -> baz", "baz -> bar")
+}
+
+func TestDependsOnPulledInOnPartialLoad(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		resourcesToLoad []model.ManifestName
+		expected        []model.ManifestName
+	}{
+		{
+			name:            "a",
+			resourcesToLoad: []model.ManifestName{"a"},
+			expected:        []model.ManifestName{"a"},
+		},
+		{
+			name:            "c",
+			resourcesToLoad: []model.ManifestName{"c"},
+			expected:        []model.ManifestName{"a", "b", "c"},
+		},
+		{
+			name:            "d, e",
+			resourcesToLoad: []model.ManifestName{"d", "e"},
+			expected:        []model.ManifestName{"a", "b", "d", "e"},
+		},
+		{
+			name:            "e",
+			resourcesToLoad: []model.ManifestName{"e"},
+			expected:        []model.ManifestName{"e"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			defer f.TearDown()
+
+			f.file("Tiltfile", `
+local_resource('a', 'echo a')
+local_resource('b', 'echo b', resource_deps=['a'])
+local_resource('c', 'echo c', resource_deps=['b'])
+local_resource('d', 'echo d', resource_deps=['b'])
+local_resource('e', 'echo e')
+`)
+
+			var args []string
+			for _, r := range tc.resourcesToLoad {
+				args = append(args, string(r))
+			}
+			f.load(args...)
+			f.assertNumManifests(len(tc.expected))
+			for _, e := range tc.expected {
+				f.assertNextManifest(e)
+			}
+		})
+	}
+}
+
+func TestMaxParallelUpdates(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		tiltfile              string
+		expectErrorContains   string
+		expectedMaxBuildSlots int
+	}{
+		{
+			name:                  "default max parallel updates",
+			tiltfile:              "print('hello world')",
+			expectedMaxBuildSlots: model.DefaultMaxParallelUpdates,
+		},
+		{
+			name:                  "set max parallel updates",
+			tiltfile:              "update_settings(max_parallel_updates=42)",
+			expectedMaxBuildSlots: 42,
+		},
+		{
+			name:                "NaN error",
+			tiltfile:            "update_settings(max_parallel_updates='boop')",
+			expectErrorContains: "got string, want int",
+		},
+		{
+			name:                "must be positive int",
+			tiltfile:            "update_settings(max_parallel_updates=-1)",
+			expectErrorContains: "must be >= 1",
+		},
+		{
+			// as more settings are configurable from this func, max_parallel_updates
+			// won't be a required arg and instead we should test that it gets
+			// set to the approprirate default; but for now, it IS required.
+			name:                "max_parallel_updates is required arg",
+			tiltfile:            "update_settings()",
+			expectErrorContains: "missing argument for max_parallel_updates",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			defer f.TearDown()
+
+			f.file("Tiltfile", tc.tiltfile)
+
+			if tc.expectErrorContains != "" {
+				f.loadErrString(tc.expectErrorContains)
+				return
+			}
+
+			f.load()
+			actualBuildSlots := f.loadResult.UpdateSettings.MaxParallelUpdates
+			assert.Equal(t, tc.expectedMaxBuildSlots, actualBuildSlots, "expected vs. actual MaxParallelUpdates")
+		})
+	}
+}
+
+// recursion is disabled by default in Starlark. Make sure we've enabled it for Tiltfiles.
+func TestRecursionEnabled(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	f.file("Tiltfile", `
+def fact(n):
+  if not n:
+    return 1
+  return n * fact(n - 1)
+
+print("fact: %d" % (fact(10)))
+`)
+
+	f.load()
+
+	require.Contains(t, f.out.String(), fmt.Sprintf("fact: %d", 10*9*8*7*6*5*4*3*2*1))
+}
+
+func TestBuiltinAnalytics(t *testing.T) {
+	f := newFixture(t)
+	defer f.TearDown()
+
+	// covering:
+	// 1. a positional arg
+	// 2. a keyword arg
+	// 3. a mix of both for the same arg
+	// 4. a builtin from a starkit extension
+	f.file("Tiltfile", `
+local('echo hi')
+local(command='echo hi')
+local('echo hi', quiet=True)
+allow_k8s_contexts("hello")
+`)
+
+	f.load()
+
+	// get the exactly one CountEvent named tiltfile.loaded
+	var countEvent analytics.CountEvent
+	for _, ce := range f.an.Counts {
+		if ce.Name == "tiltfile.loaded" {
+			require.Equal(t, "", countEvent.Name, "two count events named tiltfile.loaded")
+			countEvent = ce
+		}
+	}
+	require.NotEqual(t, "", countEvent.Name, "no count event named tiltfile.loaded")
+
+	// make sure it has all the expected builtin call counts
+	expectedCounts := map[string]string{
+		"tiltfile.invoked.local":                           "3",
+		"tiltfile.invoked.local.arg.command":               "3",
+		"tiltfile.invoked.local.arg.quiet":                 "1",
+		"tiltfile.invoked.allow_k8s_contexts":              "1",
+		"tiltfile.invoked.allow_k8s_contexts.arg.contexts": "1",
+	}
+
+	for k, v := range expectedCounts {
+		require.Equal(t, v, countEvent.Tags[k], "count for %s", k)
+	}
+}
+
 type fixture struct {
 	ctx context.Context
 	out *bytes.Buffer
@@ -3850,11 +4369,13 @@ type fixture struct {
 	kCli       *k8s.FakeK8sClient
 	k8sContext k8s.KubeContext
 	k8sEnv     k8s.Env
+	webHost    model.WebHost
 
 	ta *tiltanalytics.TiltAnalytics
 	an *analytics.MemoryAnalytics
 
 	loadResult TiltfileLoadResult
+	warnings   []string
 }
 
 func (f *fixture) newTiltfileLoader() TiltfileLoader {
@@ -3866,10 +4387,13 @@ func (f *fixture) newTiltfileLoader() TiltfileLoader {
 		feature.MultipleContainersPerPod: feature.Value{Enabled: false},
 		feature.Snapshots:                feature.Value{Enabled: true},
 	}
-	return ProvideTiltfileLoader(f.ta, f.kCli, dcc, f.k8sContext, f.k8sEnv, features)
+
+	k8sContextExt := k8scontext.NewExtension(f.k8sContext, f.k8sEnv)
+	return ProvideTiltfileLoader(f.ta, f.kCli, k8sContextExt, dcc, f.webHost, features, f.k8sEnv)
 }
 
 func newFixture(t *testing.T) *fixture {
+
 	out := new(bytes.Buffer)
 	ctx, ma, ta := testutils.ForkedCtxAndAnalyticsForTest(out)
 	f := tempdir.NewTempDirFixture(t)
@@ -3886,6 +4410,17 @@ func newFixture(t *testing.T) *fixture {
 		k8sContext:     "fake-context",
 		k8sEnv:         k8s.EnvDockerDesktop,
 	}
+
+	// Collect the warnings
+	l := logger.NewFuncLogger(false, logger.DebugLvl, func(level logger.Level, fields logger.Fields, msg []byte) error {
+		if level == logger.WarnLvl {
+			r.warnings = append(r.warnings, string(msg))
+		}
+		out.Write(msg)
+		return nil
+	})
+	r.ctx = logger.WithLogger(r.ctx, l)
+
 	return r
 }
 
@@ -3984,36 +4519,28 @@ func (f *fixture) yaml(path string, entities ...k8sOpts) {
 	f.file(path, s)
 }
 
-func matchMap(names ...string) map[string]bool {
-	m := make(map[string]bool, len(names))
-	for _, n := range names {
-		m[n] = true
-	}
-	return m
-}
-
 // Default load. Fails if there are any warnings.
-func (f *fixture) load(names ...string) {
-	f.loadAllowWarnings(names...)
-	if len(f.loadResult.Warnings) != 0 {
-		f.t.Fatalf("Unexpected no warnings. Actual: %s", f.loadResult.Warnings)
+func (f *fixture) load(args ...string) {
+	f.loadAllowWarnings(args...)
+	if len(f.warnings) != 0 {
+		f.t.Fatalf("Unexpected warnings. Actual: %s", f.warnings)
 	}
 }
 
 func (f *fixture) loadResourceAssemblyV1(names ...string) {
-	tlr := f.newTiltfileLoader().Load(f.ctx, f.JoinPath("Tiltfile"), matchMap(names...))
+	tlr := f.newTiltfileLoader().Load(f.ctx, f.JoinPath("Tiltfile"), model.NewUserConfigState(names))
 	err := tlr.Error
 	if err != nil {
 		f.t.Fatal(err)
 	}
 	f.loadResult = tlr
-	assert.Equal(f.t, []string{deprecatedResourceAssemblyV1Warning}, tlr.Warnings)
+	assert.Equal(f.t, []string{deprecatedResourceAssemblyV1Warning + "\n"}, f.warnings)
 }
 
 // Load the manifests, expecting warnings.
 // Warnings should be asserted later with assertWarnings
-func (f *fixture) loadAllowWarnings(names ...string) {
-	tlr := f.newTiltfileLoader().Load(f.ctx, f.JoinPath("Tiltfile"), matchMap(names...))
+func (f *fixture) loadAllowWarnings(args ...string) {
+	tlr := f.newTiltfileLoader().Load(f.ctx, f.JoinPath("Tiltfile"), model.NewUserConfigState(args))
 	err := tlr.Error
 	if err != nil {
 		f.t.Fatal(err)
@@ -4022,13 +4549,14 @@ func (f *fixture) loadAllowWarnings(names ...string) {
 }
 
 func unusedImageWarning(unusedImage string, suggestedImages []string) string {
-	ret := fmt.Sprintf("Image not used in any resource:\n    ✕ %s", unusedImage)
+	ret := fmt.Sprintf("Image not used in any deploy config:\n    ✕ %s", unusedImage)
 	if len(suggestedImages) > 0 {
 		ret = ret + fmt.Sprintf("\nDid you mean…")
 		for _, s := range suggestedImages {
 			ret = ret + fmt.Sprintf("\n    - %s", s)
 		}
 	}
+	ret = ret + fmt.Sprintf("\nSkipping this image build")
 	return ret
 }
 
@@ -4039,7 +4567,7 @@ func (f *fixture) loadAssertWarnings(warnings ...string) {
 }
 
 func (f *fixture) loadErrString(msgs ...string) {
-	tlr := f.newTiltfileLoader().Load(f.ctx, f.JoinPath("Tiltfile"), nil)
+	tlr := f.newTiltfileLoader().Load(f.ctx, f.JoinPath("Tiltfile"), model.UserConfigState{})
 	err := tlr.Error
 	if err == nil {
 		f.t.Fatalf("expected error but got nil")
@@ -4073,23 +4601,27 @@ func (f *fixture) assertNoMoreManifests() {
 // Helper func for asserting that the next manifest is Unresourced
 // k8s YAML containing the given k8s entities.
 func (f *fixture) assertNextManifestUnresourced(expectedEntities ...string) model.Manifest {
-	next := f.assertNextManifest(model.UnresourcedYAMLManifestName.String())
+	lowercaseExpected := []string{}
+	for _, e := range expectedEntities {
+		lowercaseExpected = append(lowercaseExpected, strings.ToLower(e))
+	}
+	next := f.assertNextManifest(model.UnresourcedYAMLManifestName)
 
 	entities, err := k8s.ParseYAML(bytes.NewBufferString(next.K8sTarget().YAML))
 	assert.NoError(f.t, err)
 
 	entityNames := make([]string, len(entities))
 	for i, e := range entities {
-		entityNames[i] = e.Name()
+		entityNames[i] = strings.ToLower(e.Name())
 	}
-	assert.Equal(f.t, expectedEntities, entityNames)
+	assert.Equal(f.t, lowercaseExpected, entityNames)
 	return next
 }
 
 type funcOpt func(*testing.T, model.Manifest) bool
 
 // assert functions and helpers
-func (f *fixture) assertNextManifest(name string, opts ...interface{}) model.Manifest {
+func (f *fixture) assertNextManifest(name model.ManifestName, opts ...interface{}) model.Manifest {
 	if len(f.loadResult.Manifests) == 0 {
 		f.t.Fatalf("no more manifests; trying to find %q (did you call `f.load`?)", name)
 	}
@@ -4113,16 +4645,22 @@ func (f *fixture) assertNextManifest(name string, opts ...interface{}) model.Man
 		case dbHelper:
 			image := nextImageTarget()
 
-			ref := image.ConfigurationRef
+			ref := image.Refs.ConfigurationRef
 			if ref.Empty() {
 				f.t.Fatalf("manifest %v has no more image refs; expected %q", m.Name, opt.image.ref)
 			}
-			if !assert.Equal(f.t, opt.image.ref, ref.String(), "manifest %v image ref", m.Name) {
+
+			expectedConfigRef := container.MustParseNamed(opt.image.ref)
+			if !assert.Equal(f.t, expectedConfigRef.String(), ref.String(), "manifest %v image ref", m.Name) {
 				f.t.FailNow()
 			}
 
-			if !assert.Equal(f.t, opt.image.deploymentRef, image.DeploymentRef.String(), "manifest %v image injected ref", m.Name) {
-				f.t.FailNow()
+			expectedLocalRef := container.MustParseNamed(opt.image.localRef)
+			require.Equal(f.t, expectedLocalRef.String(), image.Refs.LocalRef().String(), "manifest %v localRef", m.Name)
+
+			if opt.image.clusterRef != "" {
+				expectedClusterRef := container.MustParseNamed(opt.image.clusterRef)
+				require.Equal(f.t, expectedClusterRef.String(), image.Refs.ClusterRef().String(), "manifest %v clusterRef", m.Name)
 			}
 
 			assert.Equal(f.t, opt.image.matchInEnvVars, image.MatchInEnvVars)
@@ -4144,7 +4682,7 @@ func (f *fixture) assertNextManifest(name string, opts ...interface{}) model.Man
 							matcher.cmd.Argv, image.OverrideCmd.Argv)
 					}
 				case model.LiveUpdate:
-					lu := image.AnyLiveUpdateInfo()
+					lu := image.LiveUpdateInfo()
 					assert.False(f.t, lu.Empty())
 					assert.Equal(f.t, matcher, lu)
 				default:
@@ -4153,8 +4691,9 @@ func (f *fixture) assertNextManifest(name string, opts ...interface{}) model.Man
 			}
 		case cbHelper:
 			image := nextImageTarget()
-			ref := image.ConfigurationRef
-			if !assert.Equal(f.t, opt.image.ref, ref.String(), "manifest %v image ref", m.Name) {
+			ref := image.Refs.ConfigurationRef
+			expectedRef := container.MustParseNamed(opt.image.ref)
+			if !assert.Equal(f.t, expectedRef.String(), ref.String(), "manifest %v image ref", m.Name) {
 				f.t.FailNow()
 			}
 
@@ -4169,6 +4708,8 @@ func (f *fixture) assertNextManifest(name string, opts ...interface{}) model.Man
 					assert.Equal(f.t, matcher.deps, cbInfo.Deps)
 				case cmdHelper:
 					assert.Equal(f.t, matcher.cmd, cbInfo.Command)
+				case workDirHelper:
+					assert.Equal(f.t, matcher.path, cbInfo.WorkDir)
 				case tagHelper:
 					assert.Equal(f.t, matcher.tag, cbInfo.Tag)
 				case disablePushHelper:
@@ -4179,7 +4720,7 @@ func (f *fixture) assertNextManifest(name string, opts ...interface{}) model.Man
 							matcher.cmd.Argv, image.OverrideCmd.Argv)
 					}
 				case model.LiveUpdate:
-					lu := image.AnyLiveUpdateInfo()
+					lu := image.LiveUpdateInfo()
 					assert.False(f.t, lu.Empty())
 					assert.Equal(f.t, matcher, lu)
 				}
@@ -4279,8 +4820,25 @@ func (f *fixture) assertNextManifest(name string, opts ...interface{}) model.Man
 			assert.Equal(f.t, opt, m.K8sTarget().PortForwards)
 		case model.TriggerMode:
 			assert.Equal(f.t, opt, m.TriggerMode)
+		case resourceDependenciesHelper:
+			assert.Equal(f.t, opt.deps, m.ResourceDependencies)
 		case funcOpt:
 			assert.True(f.t, opt(f.t, m))
+		case localTargetHelper:
+			lt := m.LocalTarget()
+			for _, matcher := range opt.matchers {
+				switch matcher := matcher.(type) {
+				case updateCmdHelper:
+					assert.Equal(f.t, matcher.cmd, lt.UpdateCmd)
+				case serveCmdHelper:
+					assert.Equal(f.t, matcher.cmd, lt.ServeCmd)
+				case depsHelper:
+					deps := f.JoinPaths(matcher.deps)
+					assert.ElementsMatch(f.t, deps, lt.Dependencies())
+				default:
+					f.t.Fatalf("unknown matcher for local target %T", matcher)
+				}
+			}
 		default:
 			f.t.Fatalf("unexpected arg to assertNextManifest: %T %v", opt, opt)
 		}
@@ -4343,11 +4901,11 @@ func (f *fixture) assertConfigFiles(filenames ...string) {
 func (f *fixture) assertWarnings(warnings ...string) {
 	var expected []string
 	for _, warning := range warnings {
-		expected = append(expected, warning)
+		expected = append(expected, warning+"\n")
 	}
 	sort.Strings(expected)
-	sort.Strings(f.loadResult.Warnings)
-	assert.Equal(f.t, expected, f.loadResult.Warnings)
+	sort.Strings(f.warnings)
+	assert.Equal(f.t, expected, f.warnings)
 }
 
 func (f *fixture) entities(y string) []k8s.K8sEntity {
@@ -4486,22 +5044,36 @@ func fileChangeFilters(path string) matchPathHelper {
 	}
 }
 
+type resourceDependenciesHelper struct {
+	deps []model.ManifestName
+}
+
+func resourceDeps(deps ...string) resourceDependenciesHelper {
+	var mns []model.ManifestName
+	for _, d := range deps {
+		mns = append(mns, model.ManifestName(d))
+	}
+	return resourceDependenciesHelper{deps: mns}
+}
+
 type imageHelper struct {
 	ref            string
-	deploymentRef  string
+	localRef       string
+	clusterRef     string
 	matchInEnvVars bool
 }
 
 func image(ref string) imageHelper {
-	return imageHelper{ref: ref, deploymentRef: ref}
+	return imageHelper{ref: ref, localRef: ref}
 }
 
-func imageNormalized(ref string) imageHelper {
-	return image(container.MustNormalizeRef(ref))
+func (ih imageHelper) withLocalRef(localRef string) imageHelper {
+	ih.localRef = localRef
+	return ih
 }
 
-func (ih imageHelper) withInjectedRef(injectedRef string) imageHelper {
-	ih.deploymentRef = injectedRef
+func (ih imageHelper) withClusterRef(clusterRef string) imageHelper {
+	ih.clusterRef = clusterRef
 	return ih
 }
 
@@ -4552,10 +5124,6 @@ func db(img imageHelper, opts ...interface{}) dbHelper {
 	return dbHelper{image: img, matchers: opts}
 }
 
-func dbWithCache(img imageHelper, cache string, opts ...interface{}) dbHelper {
-	return dbHelper{image: img, cache: cache, matchers: opts}
-}
-
 // custom build helper
 type cbHelper struct {
 	image    imageHelper
@@ -4570,8 +5138,8 @@ type entrypointHelper struct {
 	cmd model.Cmd
 }
 
-func entrypoint(command string) entrypointHelper {
-	return entrypointHelper{model.ToShellCmd(command)}
+func entrypoint(command model.Cmd) entrypointHelper {
+	return entrypointHelper{command}
 }
 
 type addHelper struct {
@@ -4608,6 +5176,14 @@ func cmd(cmd string) cmdHelper {
 	return cmdHelper{cmd}
 }
 
+type workDirHelper struct {
+	path string
+}
+
+func workdir(path string) workDirHelper {
+	return workDirHelper{path}
+}
+
 type tagHelper struct {
 	tag string
 }
@@ -4630,6 +5206,38 @@ type disablePushHelper struct {
 
 func disablePush(disable bool) disablePushHelper {
 	return disablePushHelper{disable}
+}
+
+type updateCmdHelper struct {
+	cmd model.Cmd
+}
+
+func updateCmd(cmd string) updateCmdHelper {
+	return updateCmdHelper{model.ToShellCmd(cmd)}
+}
+
+func updateCmdArray(cmd ...string) updateCmdHelper {
+	return updateCmdHelper{model.Cmd{Argv: cmd}}
+}
+
+type serveCmdHelper struct {
+	cmd model.Cmd
+}
+
+func serveCmd(cmd string) serveCmdHelper {
+	return serveCmdHelper{model.ToShellCmd(cmd)}
+}
+
+func serveCmdArray(cmd ...string) serveCmdHelper {
+	return serveCmdHelper{model.Cmd{Argv: cmd}}
+}
+
+type localTargetHelper struct {
+	matchers []interface{}
+}
+
+func localTarget(opts ...interface{}) localTargetHelper {
+	return localTargetHelper{matchers: opts}
 }
 
 // useful scenarios to setup
@@ -4678,6 +5286,7 @@ func (f *fixture) setupHelm() {
 	f.file("helm/templates/deployment.yaml", deploymentYAML)
 	f.file("helm/templates/ingress.yaml", ingressYAML)
 	f.file("helm/templates/service.yaml", serviceYAML)
+	f.file("helm/templates/namespace.yaml", namespaceYAML)
 }
 
 func (f *fixture) setupHelmWithRequirements() {

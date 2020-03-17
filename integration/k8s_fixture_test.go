@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
 
 	"github.com/windmilleng/tilt/internal/testutils/tempdir"
@@ -114,16 +113,6 @@ func (f *k8sFixture) WaitForAllPodsReady(ctx context.Context, selector string) [
 	return f.WaitForAllPodsInPhase(ctx, selector, v1.PodRunning)
 }
 
-func (f *k8sFixture) WaitForOnePodWithAllContainersReady(ctx context.Context, selector string, timeout time.Duration) string {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	allPods := f.WaitForAllPodsReady(ctx, selector)
-	require.Len(f.t, allPods, 1, "need exactly one ready pod")
-	f.WaitForAllContainersForPodReady(ctx, allPods[0])
-	return allPods[0]
-}
-
 func (f *k8sFixture) WaitForAllPodsInPhase(ctx context.Context, selector string, phase v1.PodPhase) []string {
 	for {
 		allPodsReady, output, podNames := f.AllPodsInPhase(ctx, selector, phase)
@@ -132,6 +121,8 @@ func (f *k8sFixture) WaitForAllPodsInPhase(ctx context.Context, selector string,
 		}
 
 		select {
+		case <-f.activeTiltDone():
+			f.t.Fatalf("Tilt died while waiting for pods to be ready: %v", f.activeTiltErr())
 		case <-ctx.Done():
 			f.t.Fatalf("Timed out waiting for pods to be ready. Selector: %s. Output:\n:%s\n", selector, output)
 		case <-time.After(200 * time.Millisecond):
@@ -182,45 +173,6 @@ func (f *k8sFixture) AllPodsInPhase(ctx context.Context, selector string, phase 
 	return hasOneMatchingPod, outStr, podNames
 }
 
-func (f *k8sFixture) WaitForAllContainersForPodReady(ctx context.Context, pod string) {
-	for {
-		allContainersReady, output := f.AllContainersForPodReady(ctx, pod)
-		if allContainersReady {
-			return
-		}
-
-		select {
-		case <-ctx.Done():
-			f.t.Fatalf("Timed out waiting for containers for pod %s to be ready. Output:\n:%s\n", pod, output)
-		case <-time.After(200 * time.Millisecond):
-		}
-	}
-}
-
-// Checks that all containers for the given pod are ready
-// Returns the output (for diagnostics)
-func (f *k8sFixture) AllContainersForPodReady(ctx context.Context, pod string) (bool, string) {
-	cmd := exec.Command("kubectl", "get", "pod", pod,
-		namespaceFlag, "-o=template",
-		"--template", "{{range .status.containerStatuses}}{{.ready}}{{println}}{{end}}")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		f.t.Fatal(errors.Wrapf(err, "get pod %s", pod))
-	}
-
-	outStr := strings.TrimSpace(string(out))
-	lines := strings.Split(outStr, "\n")
-	if len(lines) == 0 {
-		return false, outStr
-	}
-	for _, line := range lines {
-		if line != "true" {
-			return false, outStr
-		}
-	}
-	return true, outStr
-}
-
 func (f *k8sFixture) ForwardPort(name string, portMap string) {
 	cmd := exec.CommandContext(f.ctx, "kubectl", "port-forward", namespaceFlag, name, portMap)
 	cmd.Stdout = os.Stdout
@@ -230,7 +182,6 @@ func (f *k8sFixture) ForwardPort(name string, portMap string) {
 		f.t.Fatal(err)
 	}
 
-	f.cmds = append(f.cmds, cmd)
 	go func() {
 		err := cmd.Wait()
 		if err != nil && !f.tearingDown {
@@ -271,7 +222,7 @@ func (f *k8sFixture) setupNewKubeConfig() {
 	}
 	f.kubeconfigPath = f.tempDir.JoinPath(kubeconfigBaseName)
 	f.tempDir.WriteFile(f.kubeconfigPath, string(current))
-	f.fixture.tiltEnviron["KUBECONFIG"] = f.kubeconfigPath
+	f.fixture.tilt.Environ["KUBECONFIG"] = f.kubeconfigPath
 	log.Printf("New kubeconfig: %s", f.kubeconfigPath)
 }
 
@@ -358,4 +309,114 @@ func (f *k8sFixture) TearDown() {
 	f.ClearNamespace()
 	f.fixture.TearDown()
 	f.tempDir.TearDown()
+}
+
+// waits for pods to be in a specified state, or times out and fails
+type podWaiter struct {
+	disallowedPodIDs map[string]bool
+	f                *k8sFixture
+	selector         string
+	expectedPhase    v1.PodPhase
+	expectedPodCount int // or -1 for no expectation
+	timeout          time.Duration
+}
+
+func (f *k8sFixture) newPodWaiter(selector string) podWaiter {
+	return podWaiter{
+		f:                f,
+		selector:         selector,
+		expectedPodCount: -1,
+		disallowedPodIDs: make(map[string]bool),
+		timeout:          time.Minute,
+	}
+}
+
+func (pw podWaiter) podPhases() (map[string]string, string) {
+	cmd := exec.Command("kubectl", "get", "pods",
+		namespaceFlag, "--selector="+pw.selector, "-o=template",
+		"--template", "{{range .items}}{{.metadata.name}} {{.status.phase}}{{println}}{{end}}")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		pw.f.t.Fatal(errors.Wrap(err, "get pods"))
+	}
+
+	ret := make(map[string]string)
+
+	outStr := string(out)
+	lines := strings.Split(outStr, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		elements := strings.Split(line, " ")
+		if len(elements) < 2 {
+			pw.f.t.Fatalf("Unexpected output of kubect get pods: %s", outStr)
+		}
+
+		name, phase := elements[0], elements[1]
+
+		ret[name] = phase
+	}
+
+	return ret, outStr
+}
+
+// if a test is transitioning from one pod id to another, it should disallow the old pod id here
+// simply waiting for pod state does not suffice - it leaves us with a race condition:
+// an old pod matching the label is up
+// we run some command causing a new pod matching the label to come up
+// while the deployment controller is swapping from the old pod to the new pod, there will be at least a moment
+// in which both pods exist. we want to ensure we've made it past the point where the old pod is gone
+func (pw podWaiter) withDisallowedPodIDs(podIDs []string) podWaiter {
+	pw.disallowedPodIDs = make(map[string]bool)
+	for _, podID := range podIDs {
+		pw.disallowedPodIDs[podID] = true
+	}
+	return pw
+}
+
+func (pw podWaiter) withExpectedPodCount(count int) podWaiter {
+	pw.expectedPodCount = count
+	return pw
+}
+
+func (pw podWaiter) withExpectedPhase(phase v1.PodPhase) podWaiter {
+	pw.expectedPhase = phase
+	return pw
+}
+
+func (pw podWaiter) withTimeout(timeout time.Duration) podWaiter {
+	pw.timeout = timeout
+	return pw
+}
+
+func (pw podWaiter) wait() []string {
+	ctx, cancel := context.WithTimeout(pw.f.ctx, pw.timeout)
+	defer cancel()
+	for {
+		okToReturn := true
+		podPhases, output := pw.podPhases()
+		var podIDs []string
+		for podID, phase := range podPhases {
+			if (pw.expectedPhase != "" && string(pw.expectedPhase) != phase) || pw.disallowedPodIDs[podID] {
+				okToReturn = false
+				break
+			}
+			podIDs = append(podIDs, podID)
+		}
+		if okToReturn &&
+			(pw.expectedPodCount == -1 || pw.expectedPodCount == len(podPhases)) {
+			return podIDs
+		}
+
+		select {
+		case <-pw.f.activeTiltDone():
+			pw.f.t.Fatalf("Tilt died while waiting for pods to be ready: %v", pw.f.activeTiltErr())
+		case <-ctx.Done():
+			pw.f.t.Fatalf("Timed out waiting for pods to be ready. Selector: %s. Output:\n:%s\n", pw.selector, output)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
 }
